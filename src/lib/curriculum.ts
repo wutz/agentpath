@@ -65,14 +65,17 @@ export const LEVEL_CHIP =
 
 /* ---------- 常用延伸资料 ---------- */
 
-/** Pi 仓库里的具体文件，课程页按代码样式展示路径 */
-const pi = (path: string): LessonRef => ({ label: 'pi 源码', path })
 const REF_PI: LessonRef = { label: 'Pi 官网与文档', href: 'https://pi.dev/' }
 const REF_PI_DOCS: LessonRef = { label: 'Pi Documentation', href: 'https://pi.dev/docs/latest' }
 const REF_PI_REPO: LessonRef = {
-  label: 'badlogic/pi-mono（GitHub）',
-  href: 'https://github.com/badlogic/pi-mono',
+  label: 'earendil-works/pi（GitHub）',
+  href: 'https://github.com/earendil-works/pi',
 }
+/** Pi 文档的某一页 */
+const doc = (slug: string, label: string): LessonRef => ({
+  label: `Pi 文档 · ${label}`,
+  href: `https://pi.dev/docs/latest/${slug}`,
+})
 const REF_ANTHROPIC_TOOLS: LessonRef = {
   label: 'Anthropic — Tool use',
   href: 'https://docs.claude.com/en/docs/agents-and-tools/tool-use/overview',
@@ -125,7 +128,7 @@ export const tracks: Track[] = [
         summary:
           'Pi 有交互式 TUI、print/JSON、RPC、SDK 四种形态。四个都跑过一遍，你才知道自己以后要用哪个口子。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '装好 Pi 并配好至少一个模型提供方（API key 或 OAuth）',
@@ -141,7 +144,7 @@ export const tracks: Track[] = [
           'RPC 模式：stdin/stdout 上的 JSON 协议',
           '四种形态的选择表',
         ],
-        refs: [REF_PI, REF_PI_DOCS],
+        refs: [doc('quickstart', 'Quickstart'), doc('usage', 'CLI 与快捷键'), doc('providers', '模型提供方')],
       },
       {
         id: 'llm-basics',
@@ -149,7 +152,7 @@ export const tracks: Track[] = [
         summary:
           '不懂 token 就调不好 agent —— 上下文爆掉、账单失控、复读机般的输出，根子都在这一节。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '算出一次请求的输入/输出 token 与费用，并解释缓存命中怎么改变这个数',
@@ -164,7 +167,7 @@ export const tracks: Track[] = [
           '采样参数对 agent 的影响',
           '流式返回与 TTFT / TPS',
         ],
-        refs: [REF_PI_DOCS],
+        refs: [doc('models', '模型与上下文窗口'), REF_PI_DOCS],
       },
       {
         id: 'tool-calling',
@@ -187,7 +190,7 @@ export const tracks: Track[] = [
           '危险工具与确认边界（这里先埋个伏笔，L2 细讲）',
           '为什么 description 比 schema 更重要',
         ],
-        refs: [REF_ANTHROPIC_TOOLS, REF_PI_DOCS],
+        refs: [REF_ANTHROPIC_TOOLS, doc('extensions', '工具注册')],
       },
     ],
   },
@@ -245,7 +248,7 @@ export const tracks: Track[] = [
           '取消与清理：半路停下时的状态一致性',
           '把某一段「打挂」：现象与定位顺序',
         ],
-        refs: [REF_PI_DOCS, pi('src/core/')],
+        refs: [doc('usage', 'steering 与快捷键'), doc('json', 'JSON 事件流')],
       },
       {
         id: 'tools-design',
@@ -253,7 +256,7 @@ export const tracks: Track[] = [
         summary:
           'agent 的能力上限由工具决定。工具设计糟糕时，换更强的模型也救不回来。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '按「一个工具一件事」的原则拆分或合并现有工具',
@@ -268,7 +271,7 @@ export const tracks: Track[] = [
           '幂等与重试：模型会重复调同一个工具',
           '输出裁剪：别让一次 grep 吃掉半个上下文',
         ],
-        refs: [REF_PI_DOCS, REF_NO_MCP],
+        refs: [doc('extensions', '工具注册与返回值'), REF_NO_MCP],
       },
       {
         id: 'system-prompt',
@@ -276,7 +279,7 @@ export const tracks: Track[] = [
         summary:
           '同一个模型、同一套工具，换一份系统提示词就是另一个 agent。Pi 把这层完全交给你改。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '读懂 Pi 的默认系统提示词分了哪几块、各自解决什么问题',
@@ -290,7 +293,7 @@ export const tracks: Track[] = [
           '提示词里的硬规则 vs 工具描述里的软约定',
           '规则失效的常见原因：位置、冲突、长度',
         ],
-        refs: [pi('src/core/system-prompt.ts'), REF_PI_DOCS],
+        refs: [doc('usage', '上下文文件与系统提示'), doc('settings', 'settings.json')],
       },
       {
         id: 'context-window',
@@ -313,7 +316,7 @@ export const tracks: Track[] = [
           '替代手段：截断、外置记忆、按需读取',
           '自定义 compaction：按主题、按代码结构、换小模型做摘要',
         ],
-        refs: [pi('docs/'), REF_PI_DOCS],
+        refs: [doc('compaction', '压缩与分支摘要'), doc('settings', 'settings.json')],
       },
       {
         id: 'sessions',
@@ -321,7 +324,7 @@ export const tracks: Track[] = [
         summary:
           '线性日志只能后悔，树可以回到任意一步重新走。这个选择直接改变了使用方式。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '解释树状会话与线性日志的差别，以及 fork 解决了什么实际问题',
@@ -335,7 +338,7 @@ export const tracks: Track[] = [
           '导出与分享：`/export`、`/share`',
           '存储格式与体积：一个文件装一棵树',
         ],
-        refs: [REF_PI_DOCS],
+        refs: [doc('sessions', '会话与树导航'), doc('session-format', 'JSONL 会话格式')],
       },
       {
         id: 'streaming-ux',
@@ -343,7 +346,7 @@ export const tracks: Track[] = [
         summary:
           '同样的模型，等三十秒黑屏和边跑边出字，用起来是两个东西。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 25,
         objectives: [
           '把模型的流式事件映射成界面上的增量更新',
@@ -357,7 +360,7 @@ export const tracks: Track[] = [
           '终端里的宽字符与重绘',
           '非终端宿主（Web / 桌面）怎么复用同一套事件',
         ],
-        refs: [REF_PI_REPO],
+        refs: [doc('tui', 'TUI 组件'), doc('json', 'JSON 事件流')],
       },
     ],
   },
@@ -377,7 +380,7 @@ export const tracks: Track[] = [
         summary:
           '工具、命令、快捷键、事件、TUI —— 扩展点的边界，就是你能改造的边界。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '列出 Pi 的扩展点，并为一个需求选出该挂在哪个点上',
@@ -391,7 +394,7 @@ export const tracks: Track[] = [
           '热重载：让 agent 改自己的扩展代码，然后 `/reload`',
           '看看官方 50+ 示例都在改什么',
         ],
-        refs: [REF_PI_DOCS, REF_PI_REPO],
+        refs: [doc('extensions', 'Extensions'), REF_PI_REPO],
       },
       {
         id: 'first-extension',
@@ -399,7 +402,7 @@ export const tracks: Track[] = [
         summary:
           '从一个真实需求出发（查内部系统、跑项目脚本），把它变成 agent 手里的工具。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 45,
         objectives: [
           '写出一个带参数校验与错误处理的自定义工具并装进 Pi',
@@ -413,7 +416,7 @@ export const tracks: Track[] = [
           '订阅事件：pre-turn 注入',
           '调试手法：日志、`--mode json`、`/reload`',
         ],
-        refs: [REF_PI_DOCS],
+        refs: [doc('extensions', 'Extensions'), doc('tui', 'ctx.ui 与渲染')],
       },
       {
         id: 'skills',
@@ -421,7 +424,7 @@ export const tracks: Track[] = [
         summary:
           '把「指令 + 工具」打成一包，用得上才进上下文 —— 渐进披露的关键是别把缓存打碎。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '判断一件事该做成 skill 还是写进系统提示词',
@@ -435,7 +438,7 @@ export const tracks: Track[] = [
           '和 AGENTS.md 的分工',
           'skill 打包与复用',
         ],
-        refs: [REF_PI_DOCS],
+        refs: [doc('skills', 'Skills'), doc('prompt-templates', '提示词模板')],
       },
       {
         id: 'permission-gate',
@@ -443,7 +446,7 @@ export const tracks: Track[] = [
         summary:
           'Pi 不内置权限弹窗 —— 这不是缺陷，是让你自己定义什么叫危险。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 40,
         objectives: [
           '实现一个按工具与参数分级的确认门',
@@ -457,7 +460,7 @@ export const tracks: Track[] = [
           '命令行审查：拦 `rm -rf` 是不够的',
           '无人值守：沙箱 + 白名单 + 事后审计',
         ],
-        refs: [pi('examples/permission-gate.ts'), pi('examples/protected-paths.ts')],
+        refs: [doc('security', '安全模型'), doc('extensions', 'tool_call 事件')],
       },
       {
         id: 'subagents',
@@ -465,7 +468,7 @@ export const tracks: Track[] = [
         summary:
           '子 agent 是省上下文的利器，也是把问题藏起来的利器。自己造一遍才知道该不该用。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '说清 sub-agent 真正解决的是上下文隔离而不是并行加速',
@@ -479,7 +482,7 @@ export const tracks: Track[] = [
           '失败传播与超时',
           '不该派出去的任务：需要全局上下文的、需要人确认的',
         ],
-        refs: [pi('examples/subagent/'), REF_EFFECTIVE_AGENTS],
+        refs: [doc('sdk', 'SDK'), REF_EFFECTIVE_AGENTS],
       },
       {
         id: 'packaging',
@@ -487,7 +490,7 @@ export const tracks: Track[] = [
         summary:
           '扩展写完只在你机器上有用；打成包就能给团队用，也能被别人的 agent 装上。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '把扩展、skill、提示词模板、主题打成一个可安装的包',
@@ -500,7 +503,7 @@ export const tracks: Track[] = [
           '版本与兼容：核心变了怎么办',
           '团队内分发的现实做法',
         ],
-        refs: [REF_PI_DOCS],
+        refs: [doc('packages', 'Pi packages'), doc('settings', 'settings.json')],
       },
       {
         id: 'quest-tool-loop',
@@ -508,7 +511,7 @@ export const tracks: Track[] = [
         summary:
           '同一个工具连调二十次，token 一路涨，任务毫无进展。在模拟终端里找出根因。',
         kind: 'quest',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '从事件流里定位重复调用的起点与触发条件',
@@ -522,7 +525,7 @@ export const tracks: Track[] = [
           '三类根因的分辨方法',
           '修复与回归验证',
         ],
-        refs: [REF_PI_DOCS],
+        refs: [doc('json', 'JSON 事件流'), doc('extensions', '工具返回值')],
       },
     ],
   },
@@ -542,7 +545,7 @@ export const tracks: Track[] = [
         summary:
           '不是所有 agent 都长成终端。SDK 模式让 Pi 变成你应用里的一个库。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 45,
         objectives: [
           '在一个 Node 服务里嵌入 Pi，接管输入输出与工具集',
@@ -556,7 +559,7 @@ export const tracks: Track[] = [
           '多用户：会话隔离、并发、排队',
           '一个真实集成的参考：OpenClaw',
         ],
-        refs: [REF_PI_DOCS],
+        refs: [doc('sdk', 'SDK'), REF_PI_REPO],
       },
       {
         id: 'rpc-integration',
@@ -564,7 +567,7 @@ export const tracks: Track[] = [
         summary:
           '宿主是 Go、Python、Rust 也照样能用 —— 一条 stdin/stdout 上的 JSON 协议而已。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '用非 JS 语言起一个 Pi 子进程并完成一轮完整对话',
@@ -577,7 +580,7 @@ export const tracks: Track[] = [
           '背压与大输出',
           '跨语言集成的坑：编码、缓冲、信号',
         ],
-        refs: [pi('docs/rpc.md')],
+        refs: [doc('rpc', 'RPC 模式'), doc('json', 'JSON 事件流')],
       },
       {
         id: 'sandbox',
@@ -585,7 +588,7 @@ export const tracks: Track[] = [
         summary:
           '与其猜哪条命令危险，不如让危险命令根本没地方落地。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '为 agent 选一档隔离方案并说明它挡住了什么、挡不住什么',
@@ -599,7 +602,7 @@ export const tracks: Track[] = [
           '凭据管理：短期令牌与代理',
           '逃逸面盘点',
         ],
-        refs: [pi('examples/sandbox/'), pi('examples/ssh.ts')],
+        refs: [doc('containerization', '容器化与沙箱'), doc('security', '安全模型')],
       },
       {
         id: 'mcp-or-cli',
@@ -607,7 +610,7 @@ export const tracks: Track[] = [
         summary:
           'Pi 明确不内置 MCP，理由值得认真读一遍 —— 然后你自己决定要不要加回来。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '对比 MCP 与「CLI + README」两种给工具的方式在上下文成本上的差别',
@@ -621,7 +624,7 @@ export const tracks: Track[] = [
           '生态现实：已有 MCP server 怎么复用',
           '用扩展接入 MCP',
         ],
-        refs: [REF_NO_MCP, REF_PI_DOCS],
+        refs: [REF_NO_MCP, doc('extensions', '运行中注册工具')],
       },
       {
         id: 'eval',
@@ -629,7 +632,7 @@ export const tracks: Track[] = [
         summary:
           '改一句提示词就可能让成功率掉一半，而你不会立刻知道 —— 除非有评测。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 45,
         objectives: [
           '建一组任务用例，能自动判定成功与失败',
@@ -643,7 +646,7 @@ export const tracks: Track[] = [
           '把评测接进 CI',
           '常见误判来源',
         ],
-        refs: [REF_EFFECTIVE_AGENTS],
+        refs: [doc('sdk', 'SDK'), REF_EFFECTIVE_AGENTS],
       },
       {
         id: 'observability',
@@ -651,7 +654,7 @@ export const tracks: Track[] = [
         summary:
           '线上 agent 出问题时，你需要的不是日志，而是能回放的一整条链路。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '为一轮 agent 执行打出可回放的完整 trace',
@@ -665,7 +668,7 @@ export const tracks: Track[] = [
           '采样与隐私：哪些内容不能存',
           '告警该看哪几个指标',
         ],
-        refs: [REF_PI_DOCS],
+        refs: [doc('environment-variables', '环境变量与会话元数据'), REF_PI_REPO],
       },
       {
         id: 'cost-latency',
@@ -673,7 +676,7 @@ export const tracks: Track[] = [
         summary:
           '同一个任务，做对缓存和模型分层能便宜一个数量级。',
         kind: 'sim',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '算出单次任务成本的构成，并指出最值得优化的那一项',
@@ -687,7 +690,7 @@ export const tracks: Track[] = [
           '延迟优化：并行工具、流式、预取',
           '给自己设预算上限',
         ],
-        refs: [REF_PI_DOCS],
+        refs: [doc('compaction', '压缩'), doc('models', '模型与价格')],
       },
     ],
   },
@@ -707,7 +710,7 @@ export const tracks: Track[] = [
         summary:
           '会写代码不难，难的是改完自己验证。测试就是编码 agent 的眼睛。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '设计一条「改动 → 验证 → 修正」的闭环，并让 agent 自己跑完',
@@ -721,7 +724,7 @@ export const tracks: Track[] = [
           '失败回灌：把报错原样喂回去',
           '大改动的分步推进与随时可停',
         ],
-        refs: [REF_PI_REPO],
+        refs: [doc('extensions', 'withFileMutationQueue'), REF_PI_REPO],
       },
       {
         id: 'ops-agent',
@@ -729,7 +732,7 @@ export const tracks: Track[] = [
         summary:
           '让 agent 碰生产环境之前，先把「哪些动作必须人点头」写成代码。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '给运维动作分级，并把不可逆动作挡在确认门后',
@@ -743,7 +746,7 @@ export const tracks: Track[] = [
           '变更留痕与回滚',
           '值班场景：什么该自动、什么该叫人',
         ],
-        refs: [{ label: 'Kubepath — K8s 工程师成长路径', href: 'https://kubepath.wutz.dev/' }],
+        refs: [{ label: 'Kubepath — K8s 工程师成长路径', href: 'https://kubepath.wutz.dev/' }, doc('containerization', '容器化与沙箱')],
       },
       {
         id: 'multi-agent',
@@ -751,7 +754,7 @@ export const tracks: Track[] = [
         summary:
           '拆成多个角色看着很美，但交接处丢的信息、翻倍的成本都得有人付。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '判断一个任务是否真的需要多个 agent',
@@ -765,7 +768,7 @@ export const tracks: Track[] = [
           '常见失败：目标漂移、互相等待、责任真空',
           '什么时候退回单 agent',
         ],
-        refs: [REF_EFFECTIVE_AGENTS],
+        refs: [REF_EFFECTIVE_AGENTS, doc('sdk', 'SDK')],
       },
       {
         id: 'memory-rag',
@@ -773,7 +776,7 @@ export const tracks: Track[] = [
         summary:
           '记住一切等于什么都记不住。记忆系统的价值在于取舍。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '区分会话内状态、项目知识与长期偏好三类记忆，各用不同存法',
@@ -787,7 +790,7 @@ export const tracks: Track[] = [
           '记忆污染与失效',
           'RAG 在 agent 里的位置',
         ],
-        refs: [REF_PI_DOCS],
+        refs: [doc('usage', '上下文文件'), doc('skills', 'Skills')],
       },
       {
         id: 'quest-runaway',
@@ -795,7 +798,7 @@ export const tracks: Track[] = [
         summary:
           '半夜的无人值守任务烧掉了大半个月预算，还改了不该改的目录。复盘并加固。',
         kind: 'quest',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '从用量与审计记录里还原失控过程',
@@ -809,7 +812,7 @@ export const tracks: Track[] = [
           '加固与回归',
           '把这次事故写成一条检查项',
         ],
-        refs: [],
+        refs: [doc('security', '安全模型'), doc('usage', 'CLI 选项')],
       },
       {
         id: 'build-your-own',
@@ -817,7 +820,7 @@ export const tracks: Track[] = [
         summary:
           '把前面所有零件按自己的工作流重新拼一遍 —— 这才是这门课的目的。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 60,
         objectives: [
           '定义自己 harness 的边界：内核放什么、扩展放什么',
@@ -831,7 +834,7 @@ export const tracks: Track[] = [
           '组装、评测、上预算',
           '往后怎么迭代',
         ],
-        refs: [REF_PI, REF_PI_REPO],
+        refs: [REF_PI, REF_PI_REPO, doc('sdk', 'SDK')],
       },
     ],
   },

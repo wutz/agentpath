@@ -22,10 +22,14 @@ agent 说到底就是一个 while 循环：让模型决定下一步调什么工�
 | **L3** | 工程化 | SDK 嵌入、RPC 集成、沙箱、MCP 取舍、评测、可观测、成本与延迟 |
 | **L4** | 真实战场 | 编码 agent、运维 agent、多 agent、长期记忆、失控闯关、造自己的 harness |
 
-共 5 个阶段 **31 节课**，其中动手环节 13 节（8 个实验 + 2 个闯关 + 3 个推演/计算器），
-已完成正文 5 节。
+共 5 个阶段 **31 节课，全部已完成正文**，约 18 小时。其中动手环节 13 节
+（8 个实验 + 2 个故障闯关 + 3 个推演/计算器）。
+
 课程大纲是全站唯一数据源，定义在 `src/lib/curriculum.ts`；`status: 'ready'` 表示已有正文，
-`'planned'` 的课打开会渲染定稿大纲占位。
+`'planned'` 的课打开会渲染定稿大纲占位（当前没有这类课）。
+
+内容口径以 <https://pi.dev/docs/latest> 的对应文档页为准，每节课的「延伸资料」直接指向
+它依据的那一页（extensions / skills / sdk / rpc / compaction / containerization / security …）。
 
 ## 交互形式
 

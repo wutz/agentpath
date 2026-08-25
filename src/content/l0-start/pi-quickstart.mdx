@@ -1,0 +1,150 @@
+Pi 有四种运行形态，同一个内核、四个口子。四个都跑一遍不是为了熟练，
+而是为了知道**以后集成时该走哪个口** —— 这个选择做错，后面全是返工。
+
+## 装上
+
+```bash
+# 推荐：npm 全局装（--ignore-scripts 关掉依赖生命周期脚本，Pi 正常安装用不到）
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+
+# 或者脚本安装
+curl -fsSL https://pi.dev/install.sh | sh
+```
+
+进项目目录直接 `pi`。第一次进来先配模型:订阅制提供方走 `/login`，
+用 API key 的直接导出环境变量再启动:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+cd ~/some-project && pi
+```
+
+`/model` 或 `Ctrl+L` 随时切模型，`Ctrl+P` 在 scoped models 之间循环。
+`--list-models` 能先看清有哪些可用。
+
+<Callout type="note" title="第一次进新项目会问你信不信这个项目">
+Pi 的 project trust 决定**要不要加载项目本地的东西** —— `.pi/settings.json`、
+`.pi/extensions`、`.pi/skills`、`.pi/SYSTEM.md` 这些。它不是沙箱，
+不限制模型能让工具做什么，只管「项目里的代码和提示词要不要读进来」。
+决定记在 `~/.pi/agent/trust.json`。
+</Callout>
+
+## 形态一：交互式 TUI
+
+默认形态。先拿一个真实小任务试手，注意观察三件事:
+
+```
+> 这个仓库是干什么的？先看 README 和目录结构再回答
+```
+
+- **工具调用是可见的** —— 每次 `read`、`bash` 都显示出来，包括参数和结果。
+- **Enter 可以插话**（steering，这一轮工具跑完就送达），**Alt+Enter** 排到最后，
+  **Escape** 直接中止、排队的消息退回编辑器。
+- **`!` 前缀直接跑 shell** —— `!git status` 的输出会一起给模型看；
+  `!!` 则是跑了但不给模型看。
+
+顺手记几个高频键:`@` 打开项目文件模糊搜索，`Tab` 补全路径，`Ctrl+X` 复制上一条回复，
+`Ctrl+G` 用外部编辑器写长 prompt，`/hotkeys` 看全部。
+
+## 形态二：print 模式，塞进脚本里
+
+```bash
+pi -p "把 CHANGELOG.md 里最近三条整理成一段发布说明"
+
+# 管道进来的 stdin 会并进初始 prompt
+cat error.log | pi -p "这堆报错的共同根因是什么"
+
+# 带文件参数
+pi @src/app.ts @src/app.test.ts -p "这两个文件的测试覆盖够吗"
+```
+
+一次性、不进 TUI、拿完结果就退。写 CI 步骤、git hook、批处理脚本用它。
+加 `--no-session` 就不落盘会话。
+
+## 形态三：JSON 事件流
+
+同一次执行，把内部事件全打出来:
+
+```bash
+pi --mode json -p "跑一下测试，失败就修" | tee run.jsonl
+```
+
+每行一个事件:`turn_start`、`message_update`（里面是 `text_delta` / `toolcall_start`
+这类增量）、`tool_execution_start` / `_end`、`compaction_start` / `_end`、
+`auto_retry_start`、`turn_end`……
+
+<Callout type="tip" title="这是你以后最常用的排障入口">
+「它为什么这么干」「钱花哪了」「哪个工具返回了空」——
+全都在这条流里。后面 L2 的闯关就是给你一份这样的 JSONL 让你找根因。
+先熟悉它长什么样。
+</Callout>
+
+## 形态四：RPC，给非 Node 宿主
+
+```bash
+pi --mode rpc --no-session
+```
+
+stdin 收命令、stdout 出响应和事件，严格 JSONL（**只按 `\n` 切行**）。
+最小往返:
+
+```json
+{"id":"req-1","type":"prompt","message":"列出当前目录的文件"}
+```
+
+Python 侧起一个子进程就能用:
+
+```python
+proc = subprocess.Popen(
+    ["pi", "--mode", "rpc", "--no-session"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+def send(cmd):
+    proc.stdin.write(json.dumps(cmd) + "\n")
+    proc.stdin.flush()
+```
+
+宿主是 Go / Python / Rust 就走这条。宿主本来就是 Node 的话，别绕子进程 —— 用 SDK
+（L3 有一节专讲），能直接拿到类型和进程内状态。
+
+## 四种形态怎么选
+
+| 形态 | 进程 | 拿到什么 | 用在 |
+| --- | --- | --- | --- |
+| 交互式 | 前台 TUI | 人来开车 | 日常干活 |
+| `-p` print | 一次性 | 最终文本 | 脚本、CI、hook |
+| `--mode json` | 一次性 | 全量事件流 | 排障、评测、埋点 |
+| `--mode rpc` | 常驻子进程 | 双向命令 + 事件 | 非 Node 宿主集成 |
+| SDK（L3） | 进程内 | 类型 + 状态 + 自定义工具 | Node 应用嵌入 |
+
+<Quiz
+  id="pick-a-mode"
+  question="你要在一个 Go 写的内部平台里嵌入 agent 能力，需要边跑边把进度推给前端。最合适的形态是？"
+  options={[
+    {
+      text: 'pi -p，每次任务起一个进程拿最终结果',
+      feedback: '拿不到中间进度，长任务前端只能干等。',
+    },
+    {
+      text: '--mode rpc，常驻子进程，读事件流推给前端',
+      correct: true,
+      feedback: '对。宿主非 Node、又需要双向交互和实时事件，RPC 正是为这个场景准备的。',
+    },
+    {
+      text: 'SDK 嵌入',
+      feedback: 'SDK 是 Node 进程内的库，Go 宿主用不上。',
+    },
+    {
+      text: '交互式 TUI，用 tmux 挂后台',
+      feedback: '能糊出来，但把终端渲染当 API 用，解析和稳定性都是坑。',
+    },
+  ]}
+  explain="判断顺序：宿主是不是 Node → 需不需要中间事件 → 是不是长驻会话。"
+/>
+
+## 交作业
+
+1. 同一个任务（比如「统计仓库各语言文件数」）用四种形态各跑一遍。
+2. 把 `--mode json` 的输出存下来，数一数这一次任务发生了几轮、调了几次工具、
+   总共多少 token。
+3. `/session` 看会话文件路径，打开看看它是怎么存的 —— L1 讲会话树时会用到。

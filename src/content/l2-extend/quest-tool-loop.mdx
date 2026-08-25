@@ -1,0 +1,223 @@
+同事凌晨挂了一个无人值守任务:「把仓库里所有过期的 API 调用换成新写法」。
+早上来看:任务没做完，账单 47 美元，会话里同一个工具被调了二十多次。
+
+他把 `--mode json` 的输出留下来了。接手，找出根因。
+
+## 接手现场
+
+<Terminal
+  id="tool-loop"
+  host="dev@build-01"
+  cwd="~/incident"
+  intro="现场只有两样东西：一份事件流 run.jsonl，和那位同事写的自定义扩展。目标有四个，按顺序推进。输入 goals 看目标，hint 要提示。"
+  commands={[
+    {
+      cmd: "ls",
+      output: `run.jsonl  repo-grep.ts  README.md`,
+    },
+    {
+      cmd: "wc -l run.jsonl",
+      output: `    1893 run.jsonl`,
+    },
+    {
+      cmd: `jq -r 'select(.type=="tool_execution_end") | .toolName' run.jsonl | sort | uniq -c | sort -rn`,
+      aliases: [
+        `jq -r 'select(.type=="tool_execution_end").toolName' run.jsonl | sort | uniq -c | sort -rn`,
+      ],
+      goal: "看清哪个工具被反复调用",
+      hint: "先统计工具调用次数：jq 取 tool_execution_end 的 toolName，再 sort | uniq -c | sort -rn",
+      output: `     23 repo_grep
+      4 read
+      2 bash
+      1 ls`,
+    },
+    {
+      cmd: `jq -r 'select(.type=="turn_end") | .usage.input_tokens' run.jsonl | tail -8`,
+      goal: "确认这是「烧钱但没进展」而不是正常的长任务",
+      hint: "看每轮的输入 token 走势：jq 取 turn_end 的 usage.input_tokens，tail 几行",
+      output: `31204
+34918
+38655
+42390
+46127
+49863
+53600
+57336`,
+    },
+    {
+      cmd: `jq -r 'select(.type=="tool_execution_start" and .toolName=="repo_grep") | .input.pattern' run.jsonl | uniq -c`,
+      goal: "看它每次调用的参数是不是在变",
+      hint: "取 tool_execution_start 里 repo_grep 的 input.pattern，用 uniq -c 看重复",
+      output: `      9 fetchLegacy(
+      7 fetchLegacy\\(
+      5 fetchLegacy
+      2 legacy fetch`,
+    },
+    {
+      cmd: `jq -r 'select(.type=="tool_execution_end" and .toolName=="repo_grep") | .result.content[0].text' run.jsonl | head -5`,
+      goal: "看工具到底返回了什么",
+      hint: "取 tool_execution_end 里 repo_grep 的 result.content[0].text，看前几条",
+      output: `
+
+ 
+ 
+ 
+（前 5 条返回都是空字符串或空白）`,
+    },
+    {
+      cmd: "cat repo-grep.ts",
+      output: `import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import { Type } from "typebox"
+
+export default function (pi: ExtensionAPI) {
+  pi.registerTool({
+    name: "repo_grep",
+    label: "Repo Grep",
+    description: "在仓库里搜索代码",          // ← 只有六个字
+    parameters: Type.Object({
+      pattern: Type.String(),                 // ← 没说是不是正则
+    }),
+    async execute(_id, params) {
+      const { stdout } = await pi.exec("rg", ["-n", params.pattern, "."])
+      return { content: [{ type: "text", text: stdout }] }   // ← 无命中时 stdout 是空串
+    },
+  })
+}`,
+    },
+    {
+      cmd: "rg -n 'fetchLegacy(' .",
+      output: `regex parse error:
+    fetchLegacy(
+               ^
+error: unclosed group
+
+（退出码 2 —— 这是报错，不是「没找到」；但 stdout 依然是空的）`,
+    },
+    {
+      cmd: `jq -r 'select(.type=="tool_execution_end" and .toolName=="repo_grep") | .result.isError' run.jsonl | sort | uniq -c`,
+      goal: "确认失败从来没被标记出来",
+      hint: "看 repo_grep 的 result.isError 分布",
+      output: `     23 null`,
+    },
+    {
+      cmd: "cat README.md",
+      output: `# 现场说明
+
+任务：把仓库里所有 fetchLegacy( 的调用换成 fetchV2(
+运行方式：pi -p --tools repo_grep,read,edit "..."（无人值守）
+结果：47 分钟后被 token 上限拦下，一处都没改成`,
+    },
+  ]}
+/>
+
+## 复盘：三类根因怎么分辨
+
+同一个现象（工具反复调用）有三种常见根因，分辨方法各不相同:
+
+| 根因 | 识别信号 | 这次是不是 |
+| --- | --- | --- |
+| **工具返回没信息** | 返回值为空 / 无变化，参数在小幅试错 | ✅ 就是它 |
+| **提示词冲突** | 参数在两种模式间来回横跳，像在「服从两个矛盾指令」 | ❌ |
+| **退出条件缺失** | 参数**完全不变**，返回值也不变，纯粹原地打转 | ❌（参数一直在变） |
+
+这次的证据链很完整:参数每次都在变（模型在试错）→ 返回值一直是空 →
+`isError` 从来没被置上 → 模型没有任何信号能判断「是没找到，还是我写错了」。
+
+**根因不是模型笨，是工具把「执行失败」伪装成了「没有结果」。**
+
+## 三处该改的地方
+
+```ts
+    async execute(_id, params) {
+      const { stdout, stderr, code } = await pi.exec("rg", ["-n", "--fixed-strings", params.pattern, "."])
+
+      // ① 区分三种结果：命中 / 没命中 / 出错
+      if (code === 2) {
+        return {
+          content: [{ type: "text", text:
+            `搜索失败：${stderr.trim()}\n` +
+            `本工具默认按字面量搜索。要用正则请去掉特殊字符或改用 regex=true。` }],
+          isError: true,                                   // ② 明确标记失败
+        }
+      }
+      if (code === 1 || !stdout.trim()) {
+        return { content: [{ type: "text", text:
+          `没有匹配「${params.pattern}」。已按字面量搜索整个仓库（排除 .git、node_modules）。` +
+          `确认拼写，或换更短的关键词。` }] }              // ③ 「没找到」也要说话
+      }
+
+      const lines = stdout.trimEnd().split("\n")
+      const head = lines.slice(0, 50).join("\n")
+      return { content: [{ type: "text", text:
+        lines.length > 50
+          ? `${head}\n\n[共 ${lines.length} 处，只显示前 50 处。缩小范围或指定目录。]`
+          : head }] }
+    },
+```
+
+再补上声明层:
+
+```ts
+    description:
+      "在仓库里按字面量搜索代码（底层是 ripgrep --fixed-strings，排除 .git 与 node_modules）。" +
+      "没有匹配时会明确告知；超过 50 处会截断并提示。需要正则请设置 regex=true。",
+    parameters: Type.Object({
+      pattern: Type.String({ description: "搜索内容，默认按字面量匹配，不是正则" }),
+      regex: Type.Optional(Type.Boolean({ description: "按正则解释 pattern" })),
+    }),
+```
+
+<Callout type="trap" title="空字符串是最坏的返回值">
+它同时可能意味着：没找到、出错了、被过滤光了、超时了。模型无法分辨，
+只能换个参数再试一次 —— 于是就有了这份 47 美元的账单。
+**任何工具在任何情况下都应该说一句话。**
+</Callout>
+
+## 为什么四道防线全没拦住
+
+| 防线 | 这次为什么失效 |
+| --- | --- |
+| 工具集白名单 | 生效了（只给了三个工具），但和这次事故无关 |
+| 轮次上限 | 没设 —— 只有 token 上限，所以它跑到 47 分钟才停 |
+| 权限门 | 生效了（没造成破坏），但拦不住「空转」 |
+| 预算上限 | 生效了，是它最后止的血 —— 代价是 47 美元 |
+
+<Callout type="tip" title="给无人值守加一条「无进展」检测">
+轮次和预算上限只能限制损失的上限，拦不住「早就该停了」。
+更有效的是进展检测：连续 N 轮没有任何写操作、或者同一个工具连续失败 M 次，
+就主动停下并报告。这条能把 47 美元变成 3 美元。
+</Callout>
+
+<Quiz
+  id="loop-root-cause"
+  question="从这次现场里，哪些证据共同指向「工具返回没信息」而不是「退出条件缺失」？"
+  options={[
+    {
+      text: '调用参数每次都在小幅变化（fetchLegacy( → fetchLegacy\\( → fetchLegacy）',
+      correct: true,
+      feedback: '对。参数在变说明模型在试错、在找出路 —— 它不是原地打转，是没拿到反馈。',
+    },
+    {
+      text: '每轮输入 token 稳定增长约 3700',
+      feedback: '这只说明历史在累积，任何长任务都会这样，不能区分根因。',
+    },
+    {
+      text: 'repo_grep 的返回内容全是空字符串',
+      correct: true,
+      feedback: '对。这是直接证据：模型每次拿到的都是「什么都没有」。',
+    },
+    {
+      text: 'isError 全部是 null —— 失败从未被标记',
+      correct: true,
+      feedback: '对。工具把执行失败伪装成了没有结果，模型连「我写错了」都无从判断。',
+    },
+  ]}
+  explain="排障顺序固定：调用次数 → 参数是否变化 → 返回值内容 → 错误标记。四步之内必到根因。"
+/>
+
+## 这一节的结论
+
+1. 排障入口永远是事件流:先数调用次数，再看参数变不变，再看返回值。
+2. 参数在变 = 模型在试错（工具没给信息）;参数不变 = 退出条件缺失。
+3. 工具必须区分「没结果」和「出错」，并且两种情况都要说话、都要给下一步。
+4. 预算上限只能限制损失上限;要早点停，得加「无进展检测」。

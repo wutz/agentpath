@@ -1,0 +1,173 @@
+线上 agent 出问题时，用户给你的信息是「它昨天下午干了件蠢事」。
+你需要的不是日志，是**能回放的一整条链路**。
+
+## 一条 trace 该包含什么
+
+按「排障时会问什么」倒推:
+
+| 你会问 | 需要记 |
+| --- | --- |
+| 它当时看到了什么？ | 系统提示指纹、上下文条数、token 数（**不一定是全文**） |
+| 它决定做什么？ | 每次工具调用的名字与参数 |
+| 结果是什么？ | 工具返回的**长度 + 是否 isError + 前若干字符** |
+| 花了多少？ | 每轮 input / output / cache_read token 与费用 |
+| 为什么停？ | `stop_reason`、是否触发压缩、是否重试、是否被拦 |
+| 用了什么？ | 模型 id、思考档、工具集版本、扩展版本 |
+
+好消息是这些 Pi 全都以事件形式发出来了 —— 你不需要改内核，
+写个扩展订阅事件即可。Pi 甚至有个专门的包 `@earendil-works/pi-telemetry`
+（厂商中立的遥测契约与参考适配器）。
+
+## 用扩展埋点
+
+```ts
+export default function (pi: ExtensionAPI) {
+  let turn = 0
+  const t0 = new Map<string, number>()
+
+  pi.on("turn_start", async (_e, ctx) => {
+    turn++
+    const usage = ctx.getContextUsage()
+    emit("turn.start", {
+      turn,
+      model: ctx.model?.id,
+      thinking: ctx.thinkingLevel,
+      contextTokens: usage?.tokens,
+      contextPercent: usage?.percent,
+    })
+  })
+
+  pi.on("tool_execution_start", async (e) => {
+    t0.set(e.toolCallId, Date.now())
+    emit("tool.start", { turn, tool: e.toolName, args: redact(e.input) })
+  })
+
+  pi.on("tool_execution_end", async (e) => {
+    emit("tool.end", {
+      turn,
+      tool: e.toolName,
+      ms: Date.now() - (t0.get(e.toolCallId) ?? Date.now()),
+      isError: e.result?.isError ?? false,
+      outputChars: textLength(e.result),          // 长度，不是内容
+      preview: firstChars(e.result, 200),         // 只留开头，够定位就行
+    })
+    t0.delete(e.toolCallId)
+  })
+
+  pi.on("turn_end", async (e) => {
+    emit("turn.end", { turn, usage: e.message?.usage, stopReason: e.message?.stopReason })
+  })
+
+  pi.on("compaction_start", async (e) => emit("compaction", { turn, reason: e.reason }))
+  pi.on("auto_retry_start", async (e) =>
+    emit("retry", { turn, attempt: e.attempt, delayMs: e.delayMs, error: e.errorMessage }))
+  pi.on("session_compact_failed", async (e) =>
+    emit("compaction.failed", { turn, reason: e.reason, aborted: e.aborted, error: e.errorMessage }))
+}
+```
+
+<Callout type="tip" title="记长度和开头，别记全文">
+工具输出动辄几万字符，全量落盘的存储和隐私成本都很高。
+「长度 + isError + 前 200 字符」在九成排障场景里已经够定位。
+真需要全文时，让工具把它写到文件里，trace 里只记路径。
+</Callout>
+
+## 用量与对账
+
+三个数分开记，别合并:
+
+```
+input_tokens        全价输入
+cache_read_tokens   缓存读取（通常一折）
+output_tokens       输出
+```
+
+只记「总 token」的话，你永远算不清缓存到底有没有生效。
+一个健康的编码 agent 会话，`cache_read` 应该占输入的大头 ——
+如果它接近零，说明你的上下文前缀不稳定（回去看 L0 那节）。
+
+拆维度也很重要:
+
+| 维度 | 回答什么问题 |
+| --- | --- |
+| 按会话 | 哪个任务特别贵 |
+| 按工具 | 哪个工具的输出在吃窗口 |
+| 按模型 | 分层路由有没有生效 |
+| 按用户/团队 | 谁在烧钱，配额怎么分 |
+
+Pi 侧还有两个现成入口:RPC 的 `get_session_stats`（含 `tokens`、`cost`、
+`contextUsage`）和工具返回里的 `usage` 字段（用来上报**嵌套的**模型调用，
+比如 sub-agent —— 不报的话你的账会凭空少一块）。
+
+## 失败分类：告警要指向可行动的原因
+
+把失败分成有明确处置方式的几类，告警才有意义:
+
+| 类别 | 识别 | 处置 |
+| --- | --- | --- |
+| **提供方故障** | 429 / 5xx / 超时，`auto_retry_*` 频繁 | 退避、切备用提供方 |
+| **上下文溢出** | `compaction` reason=`overflow`，或请求直接被拒 | 调压缩参数、裁剪工具输出 |
+| **工具错误** | `isError` 比例升高，集中在某个工具 | 修那个工具（通常是环境或权限） |
+| **被拦截** | 权限门 block 计数升高 | 看是规则太严还是模型在乱试 |
+| **空转** | 轮次涨但没有写操作 / 同工具连续失败 | 停下报警 —— 这是最贵的一类 |
+| **模型拒绝** | 输出里有拒答特征，工具调用为零 | 看提示词是不是把它逼到了拒答区 |
+
+<Callout type="warn" title="最该告警的是空转，不是报错">
+报错至少会停下来。空转是「一直在跑、一直在花钱、什么都没产出」，
+而且看指标（QPS 正常、错误率为零）完全正常。
+检测方法很朴素：连续 N 轮没有任何写操作，或同一工具连续失败 M 次。
+</Callout>
+
+## 该看的几个指标
+
+```
+成本   每任务成本 p50 / p95、缓存命中率
+效率   完成一个任务的轮次分布、工具调用次数分布
+健康   工具错误率（按工具拆）、重试率、压缩频率
+质量   任务完成率（要有判定）、人工介入率
+```
+
+`p95` 比均值重要得多 —— agent 的成本分布是长尾的，
+「大多数任务两毛钱、偶尔一次八块钱」是常态，均值会骗你。
+
+## 隐私：哪些不能存
+
+- **凭据** —— 环境变量、`Authorization` 头、`.env` 内容。埋点前先过一遍脱敏。
+- **用户数据** —— 工具读到的业务数据可能含个人信息，只留长度和哈希。
+- **完整系统提示** —— 记指纹（哈希 + 长度）就够。Pi 文档特别提醒
+  `getSystemPromptOptions()` 可能包含上下文文件全文，属于敏感内容，别写日志。
+
+采样也是个实用手段:全量记元数据（便宜），只对失败的和 1% 的成功样本记详情。
+
+<Quiz
+  id="observability-priority"
+  question="线上 agent 服务，你只能先加一项监控。加哪个最有价值？"
+  options={[
+    {
+      text: '每轮的完整 prompt 内容，方便完全回放',
+      feedback: '存储和隐私成本都最高，而且大部分内容用不上。指纹 + 元数据够了。',
+    },
+    {
+      text: '「无进展」检测：连续 N 轮没有写操作或同一工具连续失败就告警',
+      correct: true,
+      feedback: '对。空转是最贵且最隐蔽的失败形态 —— 常规指标全绿它照样在烧钱。',
+    },
+    {
+      text: '模型 API 的错误率',
+      feedback: '有用，但提供方故障通常会自愈或自动重试，不是最痛的那个。',
+    },
+    {
+      text: '每个请求的响应时间',
+      feedback: 'agent 任务耗时本来就波动巨大，单看它很难行动。',
+    },
+  ]}
+  explain="先监控「花了钱没产出」，再监控「报错」—— 前者的损失更大、发现得更晚。"
+/>
+
+## 这一节的结论
+
+1. trace 按「排障时会问什么」来设计:看到什么、做了什么、结果、花费、为什么停。
+2. Pi 的事件流就是现成的埋点源，写个扩展订阅即可。
+3. 记长度和开头，别记全文;凭据和系统提示只记指纹。
+4. 三种 token 分开记，缓存命中率是上下文设计是否健康的体检指标。
+5. 失败要分类到「有处置方式」的粒度;最该告警的是空转。

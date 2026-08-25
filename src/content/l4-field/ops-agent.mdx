@@ -1,0 +1,189 @@
+编码 agent 改错了，`git checkout` 就能回来。运维 agent 改错了，
+可能是几百个 Pod 被删、一条流量被切走、一个数据库被 drop。
+
+这一节的重点不是「怎么接 k8s」，而是**在接之前把边界定下来**。
+
+## 只读优先：先让它会查
+
+一个能用的运维 agent，八成的价值在「查」这一半:
+
+```
+告警来了 → 看事件 → 看日志 → 看指标 → 缩小范围 → 给出判断
+```
+
+这一整条链路**没有一个写操作**。先把只读做到位，团队信任建立起来，
+再谈让它动手。反过来做的团队，通常在第二周就把它关了。
+
+只读阶段的工具集就三样:
+
+```bash
+pi --tools read,grep,find,ls,bash   # bash 里只允许只读命令，靠权限门保证
+```
+
+## 动作分级
+
+写操作要分级，级别决定拦截策略:
+
+| 级 | 例子 | 策略 |
+| --- | --- | --- |
+| **L0 只读** | `get` `describe` `logs` `top` `curl -X GET` | 放行 |
+| **L1 可逆、影响单点** | 重启一个 Pod、清一个本地缓存 | 放行 + 留痕 |
+| **L2 可逆、影响面大** | 扩缩容、改 HPA、切灰度比例 | 确认 |
+| **L3 不可逆或影响生产流量** | 删 PVC、drain 节点、改 DNS、回滚数据库 | 确认 + 双人 |
+| **L4 禁止** | `delete namespace`、直连生产数据库执行 DDL | 永不放行，只给人工 runbook |
+
+分级要**落到代码**，而不是写在文档里:
+
+```ts
+const LEVEL: [RegExp, 0 | 1 | 2 | 3 | 4][] = [
+  [/^kubectl\s+(get|describe|logs|top|explain)\b/, 0],
+  [/^kubectl\s+delete\s+pod\b/, 1],
+  [/^kubectl\s+(scale|patch|rollout)\b/, 2],
+  [/^kubectl\s+(drain|cordon)\b/, 3],
+  [/^kubectl\s+delete\s+(namespace|pvc|crd)\b/, 4],
+]
+
+pi.on("tool_call", async (event, ctx) => {
+  if (!isToolCallEventType("bash", event)) return
+  const cmd = event.input.command.trim()
+  const level = LEVEL.find(([re]) => re.test(cmd))?.[1] ?? 3   // 认不出来的按 L3 处理
+
+  if (level === 0) return
+  if (level >= 4) {
+    return { block: true, reason: `L4 禁止操作。这类变更只能人工按 runbook 执行：${cmd}` }
+  }
+  if (!ctx.hasUI) {
+    return { block: true, reason: `无人值守模式下不执行 L${level} 操作：${cmd}` }
+  }
+  const ok = await ctx.ui.confirm(`L${level} 变更确认`, cmd)
+  if (!ok) return { block: true, reason: "操作被拒绝。请给出只读的替代方案或说明必要性。" }
+})
+```
+
+<Callout type="warn" title="认不出来的命令要按高危处理">
+上面那行 `?? 3` 是整段代码里最重要的一处。白名单式的分级永远有漏网的命令，
+默认值必须是「保守」而不是「放行」。
+</Callout>
+
+## 集群与凭据
+
+接入方式有三种，风险递减:
+
+| 方式 | 风险 | 适合 |
+| --- | --- | --- |
+| 直接给 agent 一个 admin kubeconfig | 最高 | 别这么做 |
+| 给一个 **RBAC 受限**的 ServiceAccount | 中 | 大多数场景 |
+| agent 只能调你自己写的运维 API（那层做鉴权和审计） | 低 | 生产 |
+
+第二种是性价比最高的:让 RBAC 去做真正的边界，权限门只是第一道提示。
+
+```yaml
+# 只读 + 少量白名单动作
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "events", "services", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch"]   # 允许扩缩容，不允许删
+```
+
+<Callout type="tip" title="让权限系统说不，而不是让正则说不">
+命令正则会被绕过（L2 那节你已经亲手绕过一次）。RBAC、IAM、数据库账号权限
+是真正的边界。正则的价值是「更早、更清楚地拒绝」，不是「最终保障」。
+</Callout>
+
+SSH 场景同理:给专用账号 + 受限 sudoers，而不是 root。
+Pi 有个 `ssh.ts` 示例扩展可以把工具执行发到远端，
+但**发到哪台、以什么身份**得你自己定。
+
+## 环境隔离与目标确认
+
+运维事故里有相当比例是「在错误的环境上执行了正确的命令」。三条:
+
+1. **一个会话只绑一个环境。** 别让同一个 agent 同时握着预发和生产的凭据。
+2. **每轮注入当前目标环境**（用 `before_agent_start` 注入到消息里，
+   不是系统提示 —— 缓存）:
+   ```
+   [环境] 当前上下文：prod-cn-north，命名空间 payment。这是生产环境。
+   ```
+3. **危险命令的确认框里显示环境名**，而且生产要显眼:
+   ```
+   L3 变更确认 · ⚠ 生产 prod-cn-north
+   kubectl drain node-12
+   ```
+
+## 留痕与回滚
+
+每一次写操作都要能回答:谁批的、改了什么、怎么回去。
+
+```ts
+pi.on("tool_execution_end", async (e, ctx) => {
+  if (!isWrite(e)) return
+  await audit.append({
+    ts: Date.now(),
+    session: ctx.sessionManager.getLeafId(),
+    env: currentEnv,
+    command: e.input?.command,
+    approvedBy: lastApprover,          // 权限门里记下来的
+    exitCode: e.result?.details?.exitCode,
+    rollback: rollbackHintFor(e),      // 「回滚：kubectl scale --replicas=3」
+  })
+})
+```
+
+Pi 的 `pi.appendEntry()` 也很适合放这类审计信息 —— 它持久化但**不进上下文**，
+既留了证据又不占窗口。
+
+回滚提示最好在**执行前**就生成:扩容前记下原副本数、patch 前记下原值。
+事后再去查往往已经查不到了。
+
+## 什么该自动、什么该叫人
+
+| 场景 | 建议 |
+| --- | --- |
+| 告警分诊、定位、写结论 | 全自动 |
+| 已知模式的自愈（清理磁盘、重启单个失败 Pod） | 自动 + 事后通报 |
+| 扩缩容、切流量 | 人确认 |
+| 涉及数据、DNS、证书 | 人执行，agent 只准备命令和检查清单 |
+| 从没见过的故障 | agent 出材料，人决策 |
+
+一个务实的中间形态:**agent 把处置方案写成可复制的命令清单 + 风险说明**，
+人看一眼粘贴执行。这个形态省掉了 80% 的排查时间，却几乎没有新增风险 ——
+很多团队最后稳定在这里，这不丢人。
+
+<Quiz
+  id="ops-boundary"
+  question="运维 agent 要接入生产集群。下面哪些是必须的？"
+  options={[
+    {
+      text: '用 RBAC 受限的 ServiceAccount，而不是 admin kubeconfig',
+      correct: true,
+      feedback: '对。真正的边界应该由权限系统提供，正则只是第一道提示。',
+    },
+    {
+      text: '命令分级时，无法识别的命令默认按高危处理',
+      correct: true,
+      feedback: '对。白名单一定有漏网，默认值必须保守。',
+    },
+    {
+      text: '一个会话同时持有预发和生产凭据，方便对比',
+      feedback: '「在错误的环境执行正确的命令」是运维事故的高频形态。一个会话一个环境。',
+    },
+    {
+      text: '写操作执行前就生成回滚提示并留痕',
+      correct: true,
+      feedback: '对。原值事后往往查不到，回滚信息必须在执行前抓。',
+    },
+  ]}
+  explain="运维 agent 的安全性来自三层：权限系统（硬）、分级拦截（早）、环境隔离（防串台）。"
+/>
+
+## 这一节的结论
+
+1. 先把只读做到位，信任建立起来再谈动手。
+2. 动作分级落到代码，认不出来的按高危处理。
+3. 边界交给 RBAC / IAM，正则只负责早拒绝和说清楚。
+4. 一个会话一个环境;确认框里显示环境名。
+5. 回滚信息执行前生成，审计用 `appendEntry` 存但不进上下文。
+6. 「agent 出方案、人粘贴执行」是个体面且高性价比的稳定形态。

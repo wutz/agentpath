@@ -1,0 +1,187 @@
+你把系统提示词里一句话从「改完自己验证」改成「改完跑测试确认」。
+成功率是涨了还是跌了？
+
+没有评测的话，答案是「不知道」—— 而且你会在三周后因为另一个原因才发现。
+agent 的每一处改动都是这种性质:**看不见的回归**。
+
+## 为什么 agent 特别需要评测
+
+普通软件改一行、行为变化是确定的。agent 不是:
+
+- 同样的输入，两次运行的工具调用序列可能完全不同。
+- 改提示词、改工具描述、换模型、改压缩策略 —— 四个维度都会影响成功率。
+- 失败往往不是崩溃，而是**悄悄做得差一点**:少验证一步、多改一个文件、绕了三轮。
+
+## 用例设计：可判定是唯一硬要求
+
+一个用例 = 初始环境 + 任务描述 + **自动判定**。第三项是门槛。
+
+```ts
+{
+  id: "fix-type-error",
+  setup: "fixtures/repo-with-type-error",     // 一个固定的仓库快照
+  task: "src/user.ts 里有个类型错误，修好它，确保 tsc 通过",
+  assert: async (workdir) => {
+    const tsc = await run("npx tsc --noEmit", workdir)
+    const diff = await run("git diff --stat", workdir)
+    return {
+      pass: tsc.code === 0,
+      // 附加指标：不只看过没过，还看代价
+      filesChanged: countFiles(diff.stdout),
+      turns: metrics.turns,
+      cost: metrics.cost,
+    }
+  },
+}
+```
+
+三类判定方式，按可靠性排序:
+
+| 方式 | 例子 | 可靠性 | 适合 |
+| --- | --- | --- | --- |
+| **程序断言** | 测试通过、类型检查通过、文件存在、API 返回符合 schema | 高 | 编码类、有客观正确性的任务 |
+| **快照对比** | 输出与基线的差异在阈值内 | 中 | 格式化、结构化提取 |
+| **LLM 评委** | 让另一个模型按 rubric 打分 | 低 | 只能这样时才用（写作、解释类） |
+
+<Callout type="warn" title="LLM 评委要单独验证">
+评委本身也会错。用之前先拿一批人工标注过的样本测评委的一致率，
+低于八成就别信它的分。另外：评委不要用被评的同一个模型，容易自我偏好。
+</Callout>
+
+## 用 SDK 跑批
+
+Pi 的 SDK 正适合做这件事 —— 可以精确控制工具集、系统提示、模型:
+
+```ts
+import { createAgentSession, ModelRuntime, SessionManager, DefaultResourceLoader }
+  from "@earendil-works/pi-coding-agent"
+
+async function runCase(c: Case, variant: Variant) {
+  const workdir = await cloneFixture(c.setup)     // 每次跑都从干净副本开始
+
+  const loader = new DefaultResourceLoader({
+    systemPromptOverride: () => variant.systemPrompt,
+    agentsFilesOverride: [],                       // 别让本机配置污染评测
+    skillsOverride: variant.skills,
+  })
+  await loader.reload()
+
+  const { session } = await createAgentSession({
+    cwd: workdir,
+    sessionManager: SessionManager.inMemory(),
+    modelRuntime: await ModelRuntime.create(),
+    model: variant.model,
+    tools: variant.tools,
+    resourceLoader: loader,
+  })
+
+  let turns = 0, cost = 0
+  session.subscribe((e) => {
+    if (e.type === "turn_end") turns++
+    // 用量从事件里累计，别自己估
+  })
+
+  const t0 = performance.now()
+  await session.prompt(c.task)
+  session.dispose()
+
+  return { ...(await c.assert(workdir)), turns, cost, ms: performance.now() - t0 }
+}
+```
+
+四条纪律:
+
+1. **每次从干净的 fixture 副本开始**。上一次跑留下的改动会让结果毫无意义。
+2. **关掉本机资源发现**（`agentsFilesOverride: []`、显式 `skillsOverride`），
+   否则你测的是「你这台机器上的 agent」。
+3. **成本和轮次也要记**。只看通过率，你会选出一个「通过了但花了十倍钱」的版本。
+4. **加超时和轮次上限**，跑飞的用例不能拖垮整批。
+
+## 随机性：跑几次才算数
+
+单次通过不代表什么。经验值:
+
+| 用途 | 重复次数 |
+| --- | --- |
+| 开发时快速看方向 | 1–2 次 |
+| 决定要不要合入 | 5 次 |
+| 对外宣称的数字 | 10 次以上 |
+
+判断「是不是真的变好了」的粗略口径:20 个用例、各跑 5 次，
+通过率变化**小于 5 个百分点基本是噪声**。要更严谨就上二项检验，
+但更实用的做法是**看失败用例的名单变没变** —— 换了一批失败用例，
+比通过率涨两个点信息量大得多。
+
+<Callout type="tip" title="失败用例名单比通过率有用">
+82% → 85% 可能是噪声。但「原来失败的三个现在过了、原来过的两个现在挂了」
+是明确信号：你的改动有真实作用，只是有副作用。
+</Callout>
+
+## 该测哪些维度
+
+| 维度 | 改动例子 | 必测 |
+| --- | --- | --- |
+| 系统提示词 | 改一句话、加一条规则 | ✅ |
+| 工具描述 | 改 description、加 promptGuidelines | ✅ |
+| 工具集 | 加/减工具 | ✅ |
+| 模型 | 换型号、换思考档 | ✅ |
+| 压缩策略 | 改 keepRecentTokens、换摘要模型 | ✅（要用长任务用例） |
+| 权限门 | 加拦截规则 | ✅（会不会把正常操作也拦了） |
+
+最后一条常被忘:**权限门是会降低成功率的**。加了拦截之后成功率掉了 10%，
+你要知道这个代价，然后决定接不接受。
+
+## 接进 CI
+
+```yaml
+# 每晚跑全量，PR 只跑快集
+- name: agent eval (fast)
+  run: bun run eval --suite fast --repeat 3
+  env:
+    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+现实约束要正视:
+
+- **贵**。20 用例 × 5 次 × 每次 0.3 美元 = 30 美元一轮。分快集（PR）和全量（每晚）。
+- **慢**。并行跑，但注意提供方的速率限制。
+- **不稳定**。提供方抖动会让 CI 红。加重试，并把「基础设施失败」和「用例失败」分开统计。
+
+## 常见误判来源
+
+1. **fixture 不干净** —— 上次的产物还在，这次「一开始就通过了」。
+2. **用例太简单** —— 全是 100%，改什么都看不出差别。要有一批**刚好在能力边界上**的用例。
+3. **判定太严** —— 要求输出逐字匹配，模型换个说法就算失败。
+4. **只测 happy path** —— 真实失败大多来自「文件不存在」「测试本来就是挂的」
+   这类脏环境，评测里要专门放几个。
+
+<Quiz
+  id="eval-signal"
+  question="你改了系统提示词，20 个用例各跑 5 次，通过率从 82% 变成 85%。合理的判断是？"
+  options={[
+    {
+      text: '有改进，合入',
+      feedback: '3 个百分点在这个样本量下大概率是噪声。别急。',
+    },
+    {
+      text: '先看失败用例名单变了没：如果是同一批用例在失败，基本是噪声；如果换了一批，说明改动有真实作用（可能还有副作用）',
+      correct: true,
+      feedback: '对。名单的变化比聚合数字信息量大得多。',
+    },
+    {
+      text: '没有变化，忽略',
+      feedback: '直接下结论也太早 —— 先看构成再说。',
+    },
+    {
+      text: '把用例加到 100 个重跑，通过率才可信',
+      feedback: '加用例是对的长期方向，但眼下先看已有数据的结构更快也更省钱。',
+    },
+  ]}
+  explain="聚合指标定方向，失败名单定结论 —— 顺便看成本和轮次有没有一起变差。"
+/>
+
+## 交作业
+
+1. 给你的 agent 建 10 个用例:5 个应该稳过、3 个在能力边界、2 个环境是脏的。
+2. 全部用程序断言判定，同时记录轮次和成本。
+3. 改一句系统提示词，各跑 5 次，看失败名单变了没。

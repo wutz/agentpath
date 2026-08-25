@@ -1,0 +1,165 @@
+扩展写完只在你机器上有用。打成包之后:团队装一条命令就能用，
+项目仓库里能声明「这个项目需要哪些扩展」，别人的 agent 也能装上你的东西。
+
+## 一个包能装什么
+
+Pi 包可以同时携带四类资源:
+
+```
+my-pi-pack/
+├── package.json
+├── src/
+│   └── index.ts          # 扩展
+├── skills/
+│   └── release/SKILL.md  # skill
+├── prompts/
+│   └── review.md         # 提示词模板
+└── themes/
+    └── midnight.json     # 主题
+```
+
+入口在 `package.json` 的 `pi` 字段里声明:
+
+```json
+{
+  "name": "@acme/pi-pack",
+  "version": "1.2.0",
+  "dependencies": {
+    "zod": "^3.0.0"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"],
+    "skills": ["./skills/release"]
+  }
+}
+```
+
+<Callout type="warn" title="运行时依赖要放 dependencies">
+`pi install` 默认走生产安装 —— 放进 `devDependencies` 的东西装完就不在了，
+扩展加载时直接报模块找不到。
+</Callout>
+
+## 装与卸
+
+```bash
+pi install npm:@acme/pi-pack          # 从 npm
+pi install git:github.com/acme/pi-pack # 从 git
+pi install npm:@acme/pi-pack -l        # -l = 只装到当前项目（local）
+
+pi list                                # 看装了什么
+pi update @acme/pi-pack                # 更新单个
+pi update --all                        # 全部
+pi remove npm:@acme/pi-pack
+```
+
+装到全局（`~/.pi/agent/`）还是项目（`.pi/`）是个真实的选择:
+
+| 装法 | 适合 | 注意 |
+| --- | --- | --- |
+| 全局 | 你个人的工具链，跨项目通用 | 换机器要重装 |
+| 项目（`-l`） | 这个仓库特有的流程、团队共享 | 需要 project trust 才会加载 |
+
+项目级的包写进项目 `settings.json` 之后，团队成员进来只要信任项目就会自动补齐 ——
+这是让「agent 配置」跟着仓库走的关键。
+
+<Callout type="note" title="pi update 不问信任">
+文档专门提了一句:`pi update` 永远不会弹项目信任提示。
+它是显式的运维命令，不是隐式加载。
+</Callout>
+
+## 给包写说明：读者是「要不要装」的人
+
+README 里回答四个问题就够，顺序别乱:
+
+1. **装了会多出什么** —— 具体列:新增 3 个工具、2 个命令、1 个 skill，名字都写出来。
+2. **需要什么前置** —— 环境变量、内网访问、外部 CLI、Node 版本。
+3. **会不会碰危险动作** —— 有没有写文件、跑命令、发网络请求。这条最该写在最前面。
+4. **怎么卸干净**。
+
+```markdown
+# @acme/pi-pack
+
+装上之后 agent 会多出：
+
+| 类型 | 名字 | 作用 |
+| --- | --- | --- |
+| 工具 | `svc_lookup` | 查内部服务台账（只读 HTTP） |
+| 工具 | `deploy` | 触发发布流水线 —— **会对外产生副作用，默认需要确认** |
+| 命令 | `/svc`、`/deploy-status` | 人工查询，不消耗模型调用 |
+| skill | `release` | 发版流程与回滚步骤 |
+
+前置：`SVC_TOKEN` 环境变量、能访问 svc.internal。
+```
+
+第 3 条不是客套 —— 扩展**以装它的人的全部系统权限运行**。
+你在写别人要装的代码，说清副作用是最低义务。
+
+## 版本与兼容
+
+Pi 迭代很快，扩展 API 会变。三条实用做法:
+
+- **在 `peerDependencies` 里声明对 `@earendil-works/pi-coding-agent` 的版本区间**，
+  让不兼容在安装时就暴露，而不是运行时报一个费解的 `undefined is not a function`。
+- **对新 API 做特性探测**而不是版本号判断:
+  ```ts
+  if (typeof (pi as any).registerMarkdownTransformer === "function") { /* 用它 */ }
+  ```
+- **在 CHANGELOG 里写清破坏性变更**。团队里有人 `pi update --all` 之后炸了，
+  你要能三分钟内定位。
+
+## 团队内分发的现实做法
+
+不想发公开 npm 的话，两条路都很成熟:
+
+```bash
+# 1. 私有 registry / GitHub Packages
+pi install npm:@acme/pi-pack
+
+# 2. 直接从内部 git（最省事，不用发版）
+pi install git:git.acme.internal/tools/pi-pack
+```
+
+git 方式适合早期迭代 —— 改完 push，团队 `pi update` 就拿到了。
+稳定之后再切 npm 拿版本管理。
+
+## 检查清单
+
+发布前过一遍:
+
+- [ ] 运行时依赖在 `dependencies` 里
+- [ ] 在干净环境里 `pi install` 过一遍（不是在开发目录里 `-e` 测的）
+- [ ] `/reload` 之后行为正常，没有残留的定时器/监听（工厂里没起后台资源）
+- [ ] 无 UI 模式（`-p`、`--mode json`）下不会卡住等对话框
+- [ ] README 写清新增了什么、需要什么、有什么副作用
+- [ ] 声明了对 Pi 的版本兼容区间
+
+<Quiz
+  id="package-layout"
+  question="你的包里有一个扩展依赖 zod。装到用户机器上后报「找不到模块 zod」。最可能的原因？"
+  options={[
+    {
+      text: 'zod 放在 devDependencies 里',
+      correct: true,
+      feedback: '对。pi install 走生产安装，devDependencies 不会被装上。',
+    },
+    {
+      text: 'package.json 里没写 pi.extensions',
+      feedback: '那样扩展压根不会被加载，报的不是模块找不到。',
+    },
+    {
+      text: 'TypeScript 没有预编译成 JS',
+      feedback: 'Pi 通过 jiti 加载 TS，不需要编译步骤。',
+    },
+    {
+      text: '装成了项目级而不是全局',
+      feedback: '范围不影响依赖能否解析。',
+    },
+  ]}
+  explain="在干净环境里真装一次，这类问题一次就暴露 —— 别只用 -e 在开发目录里测。"
+/>
+
+## 交作业
+
+1. 把前面写的扩展 + 一个 skill 打成一个包，从**内部 git** 装到另一台机器验证。
+2. 故意把依赖放进 `devDependencies` 装一次，感受一下报错长什么样。
+3. 给包写一份符合上面四问的 README，让同事只读 README 就能决定要不要装。

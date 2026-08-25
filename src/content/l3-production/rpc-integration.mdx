@@ -1,0 +1,195 @@
+宿主是 Go、Python、Rust、Java，SDK 就用不上了。这时走 RPC:
+起一个 `pi` 子进程，stdin 发命令、stdout 收响应和事件。
+
+## 起进程
+
+```bash
+pi --mode rpc --no-session
+```
+
+常用参数:`--model provider/id[:thinking]`、`--name <会话名>`、
+`--session-dir <path>`（自定义存储位置）、`--no-session`（不落盘）。
+
+Python 侧:
+
+```python
+proc = subprocess.Popen(
+    ["pi", "--mode", "rpc", "--no-session"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    text=True
+)
+
+def send(cmd):
+    proc.stdin.write(json.dumps(cmd) + "\n")
+    proc.stdin.flush()
+```
+
+## 三类 JSON 行
+
+| 方向 | 形态 | 说明 |
+| --- | --- | --- |
+| 进 stdin | 命令 | 可带 `id`，会原样回显在响应上 |
+| 出 stdout | `{"type":"response", ...}` | 对某条命令的应答 |
+| 出 stdout | 事件 | 和 SDK / JSON 模式同一套事件 |
+
+一次最简单的往返:
+
+```json
+{"id":"req-1","type":"prompt","message":"列出当前目录的文件"}
+```
+
+响应 `success: true` 只代表**被接受/排队了**，不代表跑完了 ——
+结果通过后续事件来。这一点必须在客户端设计里体现:请求-响应是两条独立的线。
+
+## 分帧：这里有个真陷阱
+
+协议是严格 JSONL，规则只有三条:
+
+1. **只按 `\n` 切行。**
+2. 输入允许 `\r\n`，收到时把结尾的 `\r` 去掉。
+3. **不要用 Node 的 `readline`** —— 文档点名说它不符合本协议，
+   因为它还会在 `U+2028` / `U+2029` 处断行，而这两个字符可能出现在代码或文本里。
+
+正确写法（Node）:
+
+```js
+while (true) {
+    const newlineIndex = buffer.indexOf("\n");
+    if (newlineIndex === -1) break;
+
+    let line = buffer.slice(0, newlineIndex);
+    buffer = buffer.slice(newlineIndex + 1);
+    if (line.endsWith("\r")) line = line.slice(0, -1);
+    onLine(line);
+}
+```
+
+<Callout type="trap" title="按「行」读取的语言都要检查这一条">
+Go 的 bufio.Scanner 默认有 64KB 行长上限 —— 一条带大工具输出的事件轻松超过。
+Python 的 for line in proc.stdout 是按 universal newlines 切的，
+`\r` 单独出现也会断行。跨语言集成里，分帧是第一个坑，而且症状是「偶发 JSON 解析失败」，
+极难查。
+</Callout>
+
+## 命令速查
+
+| 类别 | 命令 |
+| --- | --- |
+| 对话 | `prompt`（可带 `images`）、`steer`、`follow_up`、`abort` |
+| 状态 | `get_state`、`get_messages`、`get_session_stats` |
+| 模型 | `set_model`、`cycle_model`、`get_available_models` |
+| 思考档 | `set_thinking_level`、`cycle_thinking_level`、`get_available_thinking_levels` |
+| 队列 | `set_steering_mode`、`set_follow_up_mode`（`"all"` / `"one-at-a-time"`） |
+| 压缩 | `compact`、`set_auto_compaction` |
+| 重试 | `set_auto_retry`、`abort_retry` |
+| Shell | `bash`、`abort_bash` |
+| 会话 | `new_session`、`switch_session`、`fork`、`clone`、`get_entries`、`get_tree`、`export_html`、`set_session_name` |
+| 其它 | `get_commands` |
+
+流式期间发 `prompt` **必须**带 `streamingBehavior`（`"steer"` 或 `"followUp"`），
+否则报错。扩展命令（`/name`）即使在流式中也会立刻执行;
+而 `steer` / `follow_up` 这两个命令**不接受**扩展命令。
+
+`get_session_stats` 是做用量面板的入口:返回计数、`tokens`、`cost`，
+以及 `contextUsage`（`tokens` / `contextWindow` / `percent`）。
+
+## 事件与取消
+
+事件类型和 SDK 一致。取消分三种，别混:
+
+```json
+{"type":"abort"}        // 停当前这轮
+{"type":"abort_retry"}  // 停自动重试循环
+{"type":"abort_bash"}   // 停正在跑的 shell 命令
+```
+
+`new_session` / `switch_session` / `fork` / `clone` 可能被扩展否决 ——
+这时响应仍然是 `success: true`，但带 `cancelled: true`。**只看 success 会误判**。
+
+## 扩展 UI 子协议
+
+如果目标环境里装了会弹对话框的扩展（比如权限门），RPC 客户端必须实现这个子协议，
+否则 agent 会卡在等待里:
+
+```json
+// agent → 你
+{"type":"extension_ui_request","id":"uuid-1","method":"select", ...}
+
+// 你 → agent
+{"type":"extension_ui_response","id":"uuid-1","value":"Allow"}
+{"type":"extension_ui_response","id":"uuid-2","confirmed":true}
+{"type":"extension_ui_response","id":"uuid-3","cancelled":true}
+```
+
+阻塞类方法有四个:`select`、`confirm`、`input`、`editor`。
+`notify` / `setStatus` / `setWidget` / `setTitle` 这些是发完就走的，不用回。
+请求里如果带 `timeout`，agent 侧会自己超时兜底，客户端不需要另外做定时器。
+
+<Callout type="warn" title="RPC 下有一批 UI 能力是降级的">
+`custom()` 返回 undefined，`setFooter` / `setHeader` 之类是空操作，
+`getEditorText()` 返回空串。`ctx.mode` 是 `"rpc"` 而 `ctx.hasUI` 仍然为 `true` ——
+所以扩展里要用 `ctx.mode === "tui"` 而不是 `hasUI` 来判断终端专属功能。
+</Callout>
+
+## 进程管理
+
+跨语言集成里，一半的工程量在这:
+
+| 关注点 | 做法 |
+| --- | --- |
+| 启动失败 | 子进程立刻退出（配置错、找不到二进制）要能报出来，别死等 stdout |
+| 健康检查 | 定期发 `get_state`，超时无响应就重启 |
+| 退出 | 关 stdin，等一小段，再 SIGTERM，最后 SIGKILL |
+| 背压 | 事件流可能很快，读取端要有缓冲和丢弃策略（比如只保留最新的 partialResult） |
+| stderr | 单独收集 —— 协议只用 stdout，stderr 是诊断信息 |
+| 多用户 | 一个用户一个进程，最简单也最稳;进程数就是你的并发上限 |
+
+<Callout type="tip" title="一个用户一个进程，是特性不是妥协">
+进程级隔离带来的好处很实在：一个用户的 agent 崩了不影响别人；
+可以用 cgroup / ulimit 限内存和 CPU；杀进程就是彻底的取消。
+SDK 拿不到这些。
+</Callout>
+
+## 错误处理
+
+```json
+{"type":"response","command":"set_model","success":false,"error":"Model not found: invalid/model"}
+```
+
+输入本身不合法时，响应的 `command` 是 `"parse"`。
+注意 `prompt` 的失败**不会**再来一条同 id 的响应 —— 后续问题只在事件里体现
+（`agent_end` 的错误、`auto_retry_*`、`extension_error`）。客户端要把这两条线关联起来。
+
+<Quiz
+  id="rpc-framing"
+  question="你的 Go 客户端偶发报「JSON 解析失败」，只在 agent 读了大文件之后出现。最可能的原因？"
+  options={[
+    {
+      text: 'Pi 输出了非法 JSON',
+      feedback: '协议是严格 JSONL，先怀疑自己的读取端。',
+    },
+    {
+      text: '按行读取时撞上了行长上限（如 bufio.Scanner 默认 64KB），长事件被截断',
+      correct: true,
+      feedback: '对。带大工具输出的事件行很容易超过默认上限，截断后自然解析失败。',
+    },
+    {
+      text: '需要在每条命令后面加 flush',
+      feedback: '不 flush 是发不出去，不会造成收到的内容被截断。',
+    },
+    {
+      text: '应该用 --mode json 而不是 rpc',
+      feedback: 'json 模式是单向的，做不了交互；而且它同样有长行。',
+    },
+  ]}
+  explain="跨语言集成的第一课：分帧。只按 \\n 切、去掉尾部 \\r、放开行长上限。"
+/>
+
+## 这一节的结论
+
+1. RPC = 子进程 + JSONL，宿主语言随意。
+2. 分帧只按 `\n`，去掉尾部 `\r`，放开行长上限;Node 别用 `readline`。
+3. `success: true` 只表示被接受，结果在事件里;`cancelled: true` 要单独判。
+4. 装了会弹框的扩展就必须实现 UI 子协议，否则会卡死。
+5. 一个用户一个进程，把隔离和资源限制交给操作系统。

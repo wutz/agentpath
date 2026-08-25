@@ -1,0 +1,256 @@
+终端不是 agent 的终点。真正要交付给用户的，往往是一个 Web 界面、一个内部平台、
+一个机器人。这一节把 Pi 当库用。
+
+## 最小可跑
+
+```bash
+npm install @earendil-works/pi-coding-agent   # SDK 就在主包里
+```
+
+```ts
+import { createAgentSession, ModelRuntime, SessionManager }
+  from "@earendil-works/pi-coding-agent"
+
+const modelRuntime = await ModelRuntime.create()
+const { session } = await createAgentSession({
+  sessionManager: SessionManager.inMemory(),
+  modelRuntime,
+})
+
+session.subscribe((event) => {
+  if (event.type === "message_update"
+      && event.assistantMessageEvent.type === "text_delta") {
+    process.stdout.write(event.assistantMessageEvent.delta)
+  }
+})
+
+await session.prompt("当前目录里有哪些文件？")
+```
+
+十几行，你就有了一个带完整工具集、会话管理、压缩、重试的 agent。
+`createAgentSession()` 默认还会去发现扩展、skill、提示词模板、主题和上下文文件 ——
+换句话说，**用户在 `~/.pi/agent/` 里的配置会生效**。做产品时这通常不是你想要的，
+下面会讲怎么关掉。
+
+## AgentSession 的关键接口
+
+```ts
+prompt(text, options?): Promise<void>
+steer(text): Promise<void>          // 排队，本轮工具跑完就送达
+followUp(text): Promise<void>       // 等彻底停下再送达
+subscribe(listener): () => void     // 返回取消订阅函数
+setModel(model): Promise<void>
+setThinkingLevel(level): void
+compact(customInstructions?): Promise<CompactionResult>
+abort(): Promise<void>
+dispose(): void
+```
+
+只读状态:`messages`、`isStreaming`、`sessionId`、`sessionFile`、`model`。
+更底层的在 `session.agent.state`（`systemPrompt`、`tools`、`streamingMessage`…），
+`await session.agent.waitForIdle()` 等它停下。
+
+<Callout type="warn" title="流式中直接 prompt() 会抛">
+正在跑的时候调 `prompt()` 而不带 `streamingBehavior`，会直接抛异常。
+要么传 `"steer"` / `"followUp"`，要么调对应的方法。这是多用户并发场景最先踩的坑。
+</Callout>
+
+## 只给它该有的能力
+
+产品化的第一件事是收窄工具集:
+
+```ts
+const { session } = await createAgentSession({
+  modelRuntime,
+  sessionManager: SessionManager.inMemory(),
+  tools: ["read", "grep", "find", "ls"],     // 只读
+  // noTools: "builtin",                     // 或者：干掉内置，只留自己的
+  customTools: [myTool],
+  resourceLoader: loader,                    // 见下：关掉用户本地配置
+})
+```
+
+内置工具是 `read`、`bash`、`powershell`、`edit`、`write`、`grep`、`find`、`ls`，
+默认启用其中四个（read / bash / edit / write）。
+
+**注意一个反直觉的规则**:一旦你传了 `tools` 白名单，
+自定义工具和扩展工具**也必须在这个名单里**，否则不会生效。
+
+自定义工具用 `defineTool`:
+
+```ts
+import { defineTool } from "@earendil-works/pi-coding-agent"
+import { Type } from "typebox"
+
+const myTool = defineTool({
+  name: "my_tool",
+  label: "My Tool",
+  description: "Does something useful",
+  parameters: Type.Object({ input: Type.String({ description: "Input value" }) }),
+  execute: async (_toolCallId, params) => ({
+    content: [{ type: "text", text: `Result: ${params.input}` }],
+    details: {},
+  }),
+})
+```
+
+## 别让用户的本地配置漏进你的产品
+
+默认的资源发现在做产品时是个隐患:用户 `~/.pi/agent/` 里的扩展、skill、
+AGENTS.md 都会被读进来，行为就不可控了。用 `DefaultResourceLoader` 接管:
+
+```ts
+import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent"
+
+const loader = new DefaultResourceLoader({
+  systemPromptOverride: () => MY_SYSTEM_PROMPT,
+  skillsOverride: MY_SKILLS,
+  agentsFilesOverride: [],            // 不读用户的 AGENTS.md
+  extensionFactories: [myInlineExtension],
+})
+await loader.reload()                 // 必须先 reload 再传进去
+
+const { session } = await createAgentSession({ resourceLoader: loader, modelRuntime })
+```
+
+## 把事件流接到你的前端
+
+SSE 是最省事的:
+
+```ts
+app.get("/chat/:id/stream", async (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  })
+
+  const { session } = sessions.get(req.params.id)!
+  const off = session.subscribe((event) => {
+    res.write(`data: ${JSON.stringify(event)}\n\n`)
+  })
+  req.on("close", off)
+})
+```
+
+前端消费时记住 L1 讲过的两条相反约定:`message_update` 是增量要拼、
+`tool_*_update` 是累积直接换，最后以 `message_end.message` 为准，
+用 `agent_settled` 判断真的结束了。
+
+<Callout type="tip" title="别把原始事件直接透给浏览器">
+事件里可能带工具的完整输出、文件内容、系统提示。做一层投影：
+只把前端需要的字段发出去。既是安全，也能省不少带宽。
+</Callout>
+
+## 多用户：隔离、并发与生命周期
+
+```ts
+class SessionPool {
+  private map = new Map<string, { session: AgentSession; touched: number }>()
+
+  async acquire(userId: string, cwd: string) {
+    let entry = this.map.get(userId)
+    if (!entry) {
+      if (this.map.size >= MAX_CONCURRENT) throw new Error("busy")
+      const { session } = await createAgentSession({
+        cwd,                                    // 每个用户一个工作目录
+        sessionManager: SessionManager.create(cwd),
+        modelRuntime: this.modelRuntime,        // 可以共享
+        resourceLoader: this.loader,
+      })
+      entry = { session, touched: Date.now() }
+      this.map.set(userId, entry)
+    }
+    entry.touched = Date.now()
+    return entry.session
+  }
+
+  async evictIdle(maxIdleMs: number) {
+    for (const [id, e] of this.map) {
+      if (Date.now() - e.touched > maxIdleMs) {
+        await e.session.abort()
+        e.session.dispose()      // 一定要 dispose，否则监听和子进程会泄漏
+        this.map.delete(id)
+      }
+    }
+  }
+}
+```
+
+四条必须做的:
+
+1. **每个用户独立 `cwd`** —— 否则他们会互相改文件。真要隔离得干净，
+   加上容器（下一节）。
+2. **`dispose()` 必须调** —— 否则事件监听、子进程、文件句柄一路泄漏。
+3. **并发上限** —— 每个会话都在烧 token 和 CPU，没有上限就是没有成本上限。
+4. **空闲回收** —— 用户开着页面走了，会话不该常驻。
+
+## 凭据与模型
+
+```ts
+const runtime = await ModelRuntime.create({ allowModelNetwork: true, modelRefreshTimeoutMs: 15_000 })
+await runtime.setRuntimeApiKey("anthropic", "sk-...")   // 运行时覆盖，优先级最高
+```
+
+优先级:运行时覆盖 → `auth.json` → 环境变量 → 自定义提供方的兜底解析器。
+服务端产品应该显式用运行时覆盖，别依赖机器上的 `auth.json` ——
+那是给交互式用户准备的。`PI_OFFLINE` 能彻底关掉模型相关的网络请求。
+
+## 会话切换要重新绑定
+
+`/new`、`/resume`、`/fork` 这类操作在 SDK 里属于 **runtime 层**
+（`AgentSessionRuntime`），不在 `AgentSession` 上。关键陷阱:
+
+```ts
+let session = runtime.session
+let unsubscribe = session.subscribe(handler)
+
+await runtime.newSession()      // session 对象被换掉了！
+
+unsubscribe()                    // 旧的取消掉
+session = runtime.session        // 重新取
+unsubscribe = session.subscribe(handler)   // 重新订阅
+```
+
+忘了重新订阅的表现是「换会话之后前端就没消息了」，很典型。
+
+## 什么时候该用 SDK，什么时候该用 RPC
+
+| | SDK | RPC |
+| --- | --- | --- |
+| 宿主语言 | 必须 Node | 任意 |
+| 类型与状态 | 进程内直接拿 | 只能通过协议 |
+| 自定义工具 | 直接传函数 | 只能靠扩展 |
+| 崩溃隔离 | 和宿主同生共死 | 子进程挂了宿主还在 |
+| 资源上限 | 和宿主共享 | 可以按进程限制 |
+
+<Quiz
+  id="sdk-pitfalls"
+  question="你用 SDK 做了个多用户 Web 服务，上线后发现内存一直涨、老用户的消息偶尔串到新会话里。最可能漏了什么？"
+  options={[
+    {
+      text: '会话结束时没调 dispose()，并且切换会话后没有重新 subscribe',
+      correct: true,
+      feedback: '对。dispose 漏了会泄漏监听与子进程；runtime 换 session 后旧订阅失效、新的没绑上，就会出现消息错位。',
+    },
+    {
+      text: '没给每个用户单独的 modelRuntime',
+      feedback: 'modelRuntime 是可以共享的，不是这个问题的根因。',
+    },
+    {
+      text: '用了 SessionManager.inMemory()',
+      feedback: '内存会话只影响持久化，不会造成跨会话串消息。',
+    },
+    {
+      text: '工具集没有收窄',
+      feedback: '是安全问题，但和内存增长、消息串台无关。',
+    },
+  ]}
+  explain="嵌入式集成的两个常客：生命周期（dispose / 回收）和订阅重绑。"
+/>
+
+## 交作业
+
+1. 用 SDK 起一个 HTTP 服务，`POST /ask` 收问题、SSE 推事件流。
+2. 工具集收窄成只读，加一个你自己的业务工具。
+3. 加上并发上限和空闲回收，压测时观察内存曲线是否回落。

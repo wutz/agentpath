@@ -1,0 +1,167 @@
+同一个模型，配一套好工具和一套烂工具，能力差出一个档位。而工具设计糟糕时，
+换更强的模型救不回来 —— 因为瓶颈不在推理，在它拿不到有用的反馈。
+
+先看 Pi 的内置工具集，它是个很克制的样本:
+
+```
+read   bash   edit   write   grep   find   ls        （Windows 上多一个 powershell）
+```
+
+默认只开 `read` / `bash` / `edit` / `write` 四个。八个工具就撑起了一个能改代码的 agent ——
+**不是工具越多越强**，这一节讲的就是为什么。
+
+## 粒度：一个工具一件事
+
+判断标准是「模型能不能一眼知道该用哪个」:
+
+| 反面 | 问题 | 改法 |
+| --- | --- | --- |
+| `file_op(action, path, ...)` 一个工具管读写删 | 参数组合爆炸，schema 里全是「仅当 action=x 时必填」 | 拆成 `read` / `write` / `edit` |
+| `run_tests_for_module_a`、`run_tests_for_module_b`…… | 二十个近义工具，声明占满上下文 | 合成一个 `bash`，把差异交给参数 |
+| `do_everything(prompt)` | 等于没有工具，模型不知道它会发生什么 | 按副作用拆开 |
+
+`bash` 是个有意思的例外:它粒度极粗，但**语义单一**（「在 shell 里跑这个」），
+而且模型对 shell 的先验知识极其充分。这提示了真正的标准 ——
+不是粗细，是**模型能否准确预测这次调用的后果**。
+
+<Callout type="tip" title="有 CLI 的东西别包成工具">
+`git`、`kubectl`、`jq` 已经有完善的 `--help`。给模型一个 `bash` 加一句
+「这些命令可用」，比包二十个薄封装工具更省上下文、也更灵活。
+这正是 Pi 不内置 MCP 的核心论据（L3 有一节专门算这笔账）。
+</Callout>
+
+## description 是提示词的一部分
+
+Pi 的工具定义里把这件事拆得很清楚 —— 除了 `description`，还有两个专门的字段:
+
+```ts
+pi.registerTool({
+  name: "my_tool",
+  label: "My Tool",
+  description: "What this tool does",
+  promptSnippet: "Summarize or transform text according to action",
+  promptGuidelines: [
+    "Use my_tool when the user asks to summarize previously generated text.",
+  ],
+  parameters: Type.Object({
+    action: StringEnum(["list", "add"] as const),
+    text: Type.Optional(Type.String()),
+  }),
+  async execute(toolCallId, params, signal, onUpdate, ctx) {
+    onUpdate?.({ content: [{ type: "text", text: "Working..." }] })
+    return { content: [{ type: "text", text: "Done" }], details: { result: "..." } }
+  },
+})
+```
+
+注意 `promptGuidelines` 的写法。Pi 文档特别强调:这些条目是**平铺**进系统提示的
+Guidelines 段的，所以每条都必须点名自己的工具 —— 写「Use this tool when…」模型解析不出
+「this」指谁。这是个很好的提醒:**工具描述不是文档，是会被拼进提示词的句子**。
+
+## 只读 / 写入 / 危险，三档分类
+
+这个分类会在后面反复用到，越早建立越好:
+
+| 档 | 例子 | 并行 | 确认 | 幂等 |
+| --- | --- | --- | --- | --- |
+| 只读 | `read` `grep` `find` `ls` | 安全 | 不需要 | 天然幂等 |
+| 写入 | `write` `edit` | 危险 | 看策略 | 要设计 |
+| 危险 | `bash`（含 `rm` / `push` / `curl`） | 危险 | 建议 | 通常做不到 |
+
+**只读工具可以放心并行**，这是最省时间的优化。写入工具并行会互相踩:Pi 给了
+一个现成答案 —— 把整个读-改-写窗口包进 `withFileMutationQueue()`，按绝对路径排队:
+
+```ts
+return withFileMutationQueue(absolutePath, async () => {
+  await mkdir(dirname(absolutePath), { recursive: true })
+  const current = await readFile(absolutePath, "utf8")
+  const next = current.replace(params.oldText, params.newText)
+  await writeFile(absolutePath, next, "utf8")
+})
+```
+
+<Callout type="warn" title="模型会重复调同一个工具">
+它可能因为超时重试、因为没看懂结果重试、因为被 steering 打断后重试。
+写入工具要么幂等（同样参数跑两次结果一样），要么能检测出「已经做过了」。
+「追加一行」这类操作最容易出事。
+</Callout>
+
+## 错误返回的三段式
+
+工具报错时，返回值是模型唯一的反馈。写成三段最有效:
+
+```
+错误：找不到文件 src/app.ts
+原因：当前目录下没有这个路径
+可以试：src/App.tsx、src/app/index.ts（同目录下的近似文件）
+```
+
+对比一下常见的烂返回:
+
+| 烂返回 | 模型会怎么做 |
+| --- | --- |
+| `null` / 空字符串 | 以为成功，继续往下 —— 后面全错 |
+| `Error` | 原地重试同样的调用 |
+| 完整 Java 堆栈 200 行 | 吃掉几千 token，有用信息埋在里面 |
+
+在 Pi 里，工具通过**抛异常**表示失败（`execute` 里 throw），但异常消息同样会到模型手上 ——
+所以异常文本本身就要写成上面那种三段式，别丢一个 `AssertionError` 上去。
+
+## 输出裁剪：给返回值设预算
+
+工具输出是上下文里最大的变量。三条硬规则:
+
+1. **设上限**，并且在截断处说清「被截断了、总量多少、怎么拿剩下的」。
+2. **给分页参数**，`offset` / `limit` 比让模型改条件重试便宜得多。
+3. **摘要优先**:`grep` 返回「命中 47 处，分布在 6 个文件」比返回 47 行原文有用。
+
+Pi 的 `read` 就是这个路子:超长会截断并提示用 `offset`。压缩时它还会把工具结果
+序列化到 2000 字符 —— 因为 `read` 和 `bash` 的输出「通常是上下文的最大贡献者」。
+
+## `content` 与 `details`：给模型的和给界面的
+
+Pi 的工具返回分两块，这个划分很值得抄:
+
+```ts
+return {
+  content: [{ type: "text", text: "Done" }],   // → 进 LLM 上下文
+  details: { patch, diff, stats },             // → 给渲染与状态重建，不进上下文
+}
+```
+
+好处是**给人看的富信息不占模型的窗口**。diff 高亮、耗时、行数统计全放 `details`，
+`content` 里只留模型做决策需要的那几行。自己造工具时也该这么分。
+
+<Quiz
+  id="tool-design-choices"
+  question="你要给运维 agent 加操作 k8s 的能力。下面哪些做法是对的？"
+  options={[
+    {
+      text: '包 30 个细粒度工具：get_pod、get_deploy、delete_pod、scale_deploy……',
+      feedback: '30 个声明常驻上下文，而 kubectl 的 --help 本来就在。收益不抵成本。',
+    },
+    {
+      text: '给一个 kubectl 工具，只读子命令直接放行，写操作走确认门',
+      correct: true,
+      feedback: '对。语义单一、模型先验充分，同时把危险动作拦在一处。',
+    },
+    {
+      text: 'kubectl get 的输出原样回灌，哪怕是几千行 Pod 列表',
+      feedback: '一次就能吃掉大半个窗口。要加 -o 裁剪、加行数上限、加「还有 N 条」提示。',
+    },
+    {
+      text: '把「集群名、命名空间、当前上下文」这类环境信息放进工具的 details，不进上下文',
+      feedback: '这些恰恰是模型做决策需要的，应该进 content。details 放的是给界面看的富信息。',
+    },
+  ]}
+  explain="粒度看「模型能否预测后果」，输出看「模型真正需要哪几行」，危险动作集中到一处拦。"
+/>
+
+## 这一节的结论
+
+1. 工具数量是有成本的:每个声明每轮都在花钱、占窗口。
+2. 粒度的标准不是粗细，是模型能否准确预测后果;有成熟 CLI 的别包装。
+3. description / promptGuidelines 是提示词，写给模型、要点名自己。
+4. 只读可并行，写入要排队和幂等，危险动作集中拦。
+5. 错误返回写成「现象 + 原因 + 可行动作」，输出设上限并说清截断。
+6. 分清 `content`（给模型）和 `details`（给界面），别用富信息挤窗口。
