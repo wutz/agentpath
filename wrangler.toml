@@ -7,5 +7,10 @@ routes = [
   { pattern = "agentpath.wutz.dev", custom_domain = true }
 ]
 
+# 除自定义域外保留 workers.dev 与版本预览 URL：
+# 前者用于域名还没解析好时先看效果，后者给每个 version 一条独立地址，方便对比改动
+workers_dev = true
+preview_urls = true
+
 [observability]
 enabled = true
