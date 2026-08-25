@@ -1,0 +1,163 @@
+Pi 在「我们没做什么」里第一条就写着:不做 MCP。给的替代方案是
+「写带 README 的 CLI 工具，或者用扩展自己接 MCP」。
+
+这个取舍值得认真算一遍 —— 算完你可能同意，也可能不同意，但至少是自己算的。
+
+## 两种给工具的方式
+
+**MCP（Model Context Protocol）** 的形态:一个 server 暴露一组工具，
+harness 连上去，把这些工具的声明**全部**注入到每次请求里。
+
+**CLI + 说明** 的形态:给 agent 一个 `bash` 工具，加一句
+「这些命令可用:`gh`、`kubectl`、`jq`」。用到时它自己 `--help`。
+
+## 先算上下文这笔账
+
+假设接一个中等规模的 MCP server，20 个工具，每个声明（name + description + schema）
+平均 250 token:
+
+```
+20 × 250 = 5000 token
+```
+
+这 5000 token **每一轮都要重发**。一个 40 轮的任务:
+
+| | MCP 全量注册 | CLI + 一句说明 |
+| --- | --- | --- |
+| 常驻声明 | 5000 token | 约 60 token |
+| 40 轮累计（未命中缓存） | 200k token | 2.4k token |
+| 实际用到的工具 | 通常 2–3 个 | 按需 |
+
+缓存能把这笔钱压到一折左右，但**窗口占用是压不掉的** —— 5000 token 就是从
+可用预算里实打实扣掉的。接三个 MCP server 就是 15k，一个 32k 窗口的模型直接废掉一半。
+
+<Callout type="note" title="这才是 Pi 的核心论据">
+不是「MCP 协议不好」，而是「把二十个工具常驻在上下文里，为了用其中两个」这件事不划算。
+渐进披露（skill）和 CLI 自查（`--help`）都是同一个思路的产物。
+</Callout>
+
+## 但 CLI 方式也有账要算
+
+公平起见，反面也列清楚:
+
+| CLI 方式的成本 | 说明 |
+| --- | --- |
+| 探索开销 | 模型可能要跑 `--help`、试错一两次，这也花 token 和时间 |
+| 输出不结构化 | 人类可读的表格要模型自己解析，偶尔会读错 |
+| 环境依赖 | 命令得先装上、认证要先配好 |
+| 更难拦 | 一个 `bash` 口子，权限门的判断复杂度上升 |
+| 无 CLI 的场景 | 内部系统只有 HTTP API 时，你还是要包一层 |
+
+所以真正的判断不是「MCP vs CLI」，而是这张表:
+
+| 情况 | 选 |
+| --- | --- |
+| 目标系统有成熟 CLI（git、kubectl、gh、docker、jq） | **CLI**。模型的先验知识足够，`--help` 就是文档 |
+| 用得很频繁（每个任务都用） | 包成**自定义工具**，把结构化输出做好 |
+| 用得少但存在成熟 MCP server | 按需装载:**默认不注册**，需要时用命令/skill 打开 |
+| 内部系统，只有 HTTP API，且高频 | 写**扩展工具**，顺便把输出裁剪和错误提示做对 |
+| 生态里只有 MCP 实现，没别的路 | **用扩展接 MCP**，但只挑需要的工具注册 |
+
+## 按需注册：把两者的好处都拿到
+
+Pi 允许**运行中注册工具**，而且立刻可用不需要 `/reload`。
+这给了一个很实用的中间形态 —— 工具组按需开关:
+
+```ts
+export default function (pi: ExtensionAPI) {
+  const GROUPS: Record<string, string[]> = {
+    k8s: ["kubectl_get", "kubectl_describe", "kubectl_logs"],
+    db:  ["sql_query", "sql_explain"],
+  }
+
+  // 启动时只保留基础工具
+  pi.on("session_start", async () => {
+    pi.setActiveTools(["read", "grep", "find", "ls", "bash"])
+  })
+
+  pi.registerCommand("tools", {
+    description: "开关一组工具：/tools k8s",
+    handler: async (args, ctx) => {
+      const group = GROUPS[args.trim()]
+      if (!group) return ctx.ui.notify(`可选：${Object.keys(GROUPS).join(", ")}`, "warn")
+      pi.setActiveTools([...pi.getActiveTools(), ...group])
+      ctx.ui.notify(`已启用 ${args.trim()} 工具组`, "info")
+    },
+  })
+}
+```
+
+再配一个 skill 描述「什么时候需要 k8s 工具组、怎么打开」，
+模型自己就会在需要时提出来。**常驻的只有一句描述，不是二十个 schema。**
+
+## 真要接 MCP：只挑需要的
+
+用扩展把 MCP server 的工具转成 Pi 工具，关键是**别全量转**:
+
+```ts
+const WANTED = new Set(["search_issues", "create_issue"])   // 20 个里只要 2 个
+
+for (const tool of await mcpClient.listTools()) {
+  if (!WANTED.has(tool.name)) continue
+  pi.registerTool({
+    name: `gh_${tool.name}`,
+    label: tool.name,
+    description: tool.description,       // 建议重写：MCP 的描述往往是给机器看的
+    parameters: toTypebox(tool.inputSchema),
+    async execute(_id, params, signal) {
+      const out = await mcpClient.callTool(tool.name, params, { signal })
+      return { content: [{ type: "text", text: truncate(summarize(out)) }], details: { raw: out } }
+    },
+  })
+}
+```
+
+顺手做三件 MCP 原生给不了的事:**重写 description**（原始描述常常太机器）、
+**裁剪输出**（MCP 的返回经常是完整 JSON）、**分 content / details**。
+
+<Callout type="tip" title="判断的落点始终是上下文预算">
+回到 L1 的计算器：把工具数从 12 调到 40、每个 320 token，
+看「固定开销」那一栏的变化和撞墙轮次的变化。
+决策不该靠立场，靠那两个数字。
+</Callout>
+
+## 一个常被忽略的角度：谁维护
+
+MCP server 是别人写的，描述、输出格式、错误信息都不由你控制。
+出问题时你能改的很有限。自己包的工具反过来 —— 多花两小时写，
+但 description 能按你的模型调、输出能按你的窗口裁、错误能按你的排障习惯写。
+
+用得越频繁，自己包的回报越高。
+
+<Quiz
+  id="mcp-or-cli-choice"
+  question="团队想让 agent 能查内部监控系统（有 HTTP API，没有 CLI，几乎每个排障任务都要用）。最合适的做法是？"
+  options={[
+    {
+      text: '找一个通用的 HTTP MCP server 接上去',
+      feedback: '能用，但描述和输出都不由你控制，而这是个高频场景 —— 最该自己把控的那一类。',
+    },
+    {
+      text: '写一个扩展工具，输出裁剪成模型需要的几行，错误提示写成三段式',
+      correct: true,
+      feedback: '对。高频 + 内部系统 + 无 CLI，正是自己包工具回报最高的组合。',
+    },
+    {
+      text: '给 agent 一个 bash 工具，让它自己用 curl 调 API',
+      feedback: '认证、URL 拼接、JSON 解析全靠它试错，高频场景下浪费巨大。',
+    },
+    {
+      text: '写进 AGENTS.md，把常用查询的 curl 命令都列出来',
+      feedback: '每轮重发一堆 curl 模板，而且照样要模型自己解析返回。',
+    },
+  ]}
+  explain="频率决定投入：高频的自己包，低频的按需装载，有成熟 CLI 的直接用 CLI。"
+/>
+
+## 这一节的结论
+
+1. 争论的实质不是协议好坏，是「常驻上下文的成本」。
+2. 有成熟 CLI 的直接用 CLI;高频内部系统自己包工具;低频的按需装载。
+3. Pi 支持运行中注册工具 —— 工具组开关是两全的中间形态。
+4. 真接 MCP 就只挑要用的几个，并重写描述、裁剪输出。
+5. 用决策数字（固定开销、撞墙轮次）说话，别用立场。

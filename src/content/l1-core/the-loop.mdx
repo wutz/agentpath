@@ -1,0 +1,189 @@
+这一节不引任何框架，从空文件开始写一个能干活的 agent。写完你会发现两件事：
+核心真的只有几十行；而剩下所有的复杂度，都长在「怎么不让它出事」上。
+
+准备一个能跑 Node 的目录和一个 API key。
+
+```bash
+mkdir mini-agent && cd mini-agent
+npm init -y && npm i @anthropic-ai/sdk
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+## 骨架
+
+三样东西：一个 `messages` 数组、一张工具表、一个 `while`。
+
+```js
+// agent.js
+import Anthropic from '@anthropic-ai/sdk'
+import { readFileSync } from 'node:fs'
+import { execSync } from 'node:child_process'
+
+const client = new Anthropic()
+
+const TOOLS = [
+  {
+    name: 'read_file',
+    description:
+      '读取工作目录下的文件。路径为相对路径。超过 400 行会被截断，截断时会明确说明。',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string' } },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'bash',
+    description:
+      '在工作目录里执行 shell 命令，返回 stdout + stderr。命令失败时返回错误文本而不是抛异常。',
+    input_schema: {
+      type: 'object',
+      properties: { cmd: { type: 'string' } },
+      required: ['cmd'],
+    },
+  },
+]
+
+/* 工具实现：注意每个分支都返回字符串，绝不抛出去 */
+function runTool(name, input) {
+  try {
+    if (name === 'read_file') {
+      const lines = readFileSync(input.path, 'utf8').split('\n')
+      const head = lines.slice(0, 400).join('\n')
+      return lines.length > 400
+        ? `${head}\n\n[已截断，共 ${lines.length} 行。需要后面的内容请用 bash + sed 指定范围。]`
+        : head
+    }
+    if (name === 'bash') {
+      return execSync(input.cmd, { encoding: 'utf8', timeout: 60_000 }).slice(0, 30_000)
+    }
+    return `错误：没有名为 ${name} 的工具`
+  } catch (e) {
+    // 报错也是有效返回值 —— 这是模型自我纠错的唯一依据
+    return `错误：${e.stdout ?? ''}${e.stderr ?? ''}${e.message}`.slice(0, 8000)
+  }
+}
+```
+
+## 循环
+
+```js
+const MAX_TURNS = 25
+const MAX_TOKENS = 400_000
+
+async function run(task) {
+  const messages = [{ role: 'user', content: task }]
+  let turns = 0
+  let used = 0
+
+  while (true) {
+    if (++turns > MAX_TURNS) return `已达轮次上限（${MAX_TURNS}），停下来了。`
+    if (used > MAX_TOKENS) return `已达 token 上限（${MAX_TOKENS}），停下来了。`
+
+    const resp = await client.messages.create({
+      model: 'claude-sonnet-5',
+      max_tokens: 8000,
+      system: '你是一个在本地工作目录里干活的助手。改动前先读相关文件，改完自己验证。',
+      tools: TOOLS,
+      messages,
+    })
+    used += resp.usage.input_tokens + resp.usage.output_tokens
+
+    // 模型不再要求调工具 —— 这一轮结束
+    if (resp.stop_reason !== 'tool_use') {
+      return resp.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n')
+    }
+
+    const calls = resp.content.filter((c) => c.type === 'tool_use')
+    for (const c of calls) console.log(`  → ${c.name}`, JSON.stringify(c.input).slice(0, 120))
+
+    messages.push({ role: 'assistant', content: resp.content })
+    messages.push({
+      role: 'user',
+      content: calls.map((c) => ({
+        type: 'tool_result',
+        tool_use_id: c.id,
+        content: runTool(c.name, c.input),
+      })),
+    })
+  }
+}
+
+console.log(await run(process.argv[2] ?? '看一眼这个目录，告诉我它是干什么的'))
+```
+
+跑起来：
+
+```bash
+node agent.js "统计这个仓库里各语言的文件数，写进 STATS.md"
+```
+
+<Callout type="tip" title="先看它怎么犯错">
+把任务换成一个它一定会踩坑的：比如让它读一个不存在的文件。观察它收到
+`错误：ENOENT ...` 之后的下一步 —— 那一步就是「回灌错误」的全部价值。
+</Callout>
+
+## 三个退出条件，漏一个都出事
+
+| 退出条件 | 漏掉的后果 |
+| --- | --- |
+| `stop_reason !== 'tool_use'` | 循环永不结束，模型答完了还在被反复追问 |
+| 轮次上限 | 卡在一个工具上反复重试，几十轮之后你才发现 |
+| token / 预算上限 | 无人值守时能烧掉整个月的额度 |
+
+再加上两个真实场景必备的：**墙钟超时**（单个工具卡住不返回）和**用户中断**
+（Ctrl+C 要能干净地停下，不留半截状态）。
+
+<Callout type="warn" title="上限要「说清原因」地停">
+返回一句 `已达轮次上限` 比静默 `break` 有用得多 —— 无论是给人看还是喂给上层调用方，
+都需要知道它是干完了还是被拦下了。
+</Callout>
+
+## 和 Pi 比一比：多出来的都是什么
+
+你这八十行已经是一个 agent 了。Pi 在同一个位置上多做的事情，大致是这几类：
+
+- **上下文管理** —— 接近窗口时自动压缩（否则第十几轮直接报错崩掉）
+- **人在环** —— 跑到一半插话（steering）、排队消息、干净地取消
+- **状态** —— 会话存成一棵树，任意节点可以 fork 重开
+- **可改造** —— 工具、命令、快捷键、提示词都能被扩展替换
+- **多模型** —— 十几家提供方，`Ctrl+L` 随时切
+- **展示** —— 流式事件驱动的 TUI，工具执行过程可见可中断
+
+这份清单就是 L1 剩下几节和 L2 的目录。每一项都是「你自己写下去早晚会遇到」的问题。
+
+<Quiz
+  id="loop-exit"
+  question="你的最小 agent 跑起来后，同一个 bash 命令被连续调用了十几次，参数几乎没变。最该先检查什么？"
+  options={[
+    {
+      text: '换一个更强的模型',
+      feedback: '换模型可能掩盖问题，但根因大概率还在。先看反馈链路。',
+    },
+    {
+      text: '工具返回给模型的内容 —— 是不是空的、或者没有可行动的信息',
+      correct: true,
+      feedback: '对。重复调用几乎总是因为模型没从返回值里拿到新信息，只能原地重试。',
+    },
+    {
+      text: '把 MAX_TURNS 调大，让它多试几轮',
+      feedback: '这会让浪费更久。轮次上限是保险，不是解决手段。',
+    },
+    {
+      text: '在 system 里加一句「不要重复调用工具」',
+      feedback: '提示词压不住信息缺失。模型不是不想往前走，是它不知道往哪走。',
+    },
+  ]}
+  explain="回灌质量决定 agent 的收敛速度 —— 这是整门课最高频的一条排障线索。"
+/>
+
+## 交作业
+
+把这个 mini-agent 留着，后面几节会反复回来改它：
+
+1. 加一条 `write_file` 工具，并给它加上路径白名单（只允许写工作目录内）。
+2. 给 `bash` 加确认门：命令里出现 `rm`、`git push`、`curl` 时先问一句。
+3. 打印每轮的累计 token 与估算花费，让成本变成看得见的数。
+
+这三件事分别对应 L2 的权限门、L3 的成本与可观测。你先自己写一版，
+读 Pi 的实现时会舒服很多。

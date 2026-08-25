@@ -1,0 +1,224 @@
+周五晚上，同事挂了一个无人值守任务:「把所有服务的镜像 tag 从 v1 升到 v2，
+改完提交 PR」。周一早上:
+
+- 账单多了 **312 美元**
+- `~/.ssh/config` 被改过
+- 三个仓库里出现了内容诡异的 PR
+- 任务本身没完成
+
+四道防线，一道都没拦住。找出每一道为什么失效。
+
+## 现场
+
+<Terminal
+  id="runaway"
+  host="ops@bastion-1"
+  cwd="~/postmortem"
+  intro="现场材料：账单导出、审计日志、当时的启动命令和权限门代码。目标有五个 —— 先还原过程，再逐道防线复查。输入 goals 看目标。"
+  commands={[
+    {
+      cmd: "ls",
+      output: `billing.csv  audit.jsonl  launch.sh  gate.ts  settings.json`,
+    },
+    {
+      cmd: "cat launch.sh",
+      goal: "看清它是怎么被启动的",
+      hint: "先看启动命令 —— 大部分事故的根因写在这一行里",
+      output: `#!/bin/bash
+# 周五 19:40 由 cron 触发
+export ANTHROPIC_API_KEY=$(cat ~/.secrets/anthropic)
+cd ~/work
+pi -p --approve "把 services/ 下所有 deployment.yaml 的镜像 tag 从 v1 升到 v2，
+每个仓库单独提 PR" 2>&1 | tee run.log`,
+    },
+    {
+      cmd: "cat settings.json",
+      output: `{
+  "compaction": { "enabled": true, "reserveTokens": 16384 },
+  "defaultProjectTrust": "always"
+}`,
+    },
+    {
+      cmd: `awk -F, 'NR>1 {s+=$4} END {print "总额 $" s}' billing.csv`,
+      aliases: ["cat billing.csv"],
+      goal: "确认钱花在哪个时段、哪一类调用上",
+      hint: "先把总额加起来，再按小时看分布",
+      output: `总额 $312.47`,
+    },
+    {
+      cmd: `awk -F, 'NR>1 {h=substr($1,12,2); c[h]+=$4} END {for (i in c) printf "%s时  $%.2f\\n", i, c[i]}' billing.csv | sort`,
+      output: `19时  $2.10
+20时  $6.80
+21时  $18.40
+22时  $47.90
+23时  $88.30
+00时  $92.60
+01时  $56.37
+（02 时之后归零 —— 没有任何上限触发，是 cron 到点被下一个任务顶掉了）`,
+    },
+    {
+      cmd: `jq -r 'select(.type=="tool.end") | .tool' audit.jsonl | sort | uniq -c | sort -rn`,
+      goal: "看它这一夜到底在干什么",
+      hint: "统计工具调用次数",
+      output: `   1847 bash
+    412 read
+     93 edit
+      6 write`,
+    },
+    {
+      cmd: `jq -r 'select(.tool=="bash") | .args.command' audit.jsonl | grep -v '^kubectl\\|^git status\\|^ls\\|^cat' | sort | uniq -c | sort -rn | head -12`,
+      goal: "找出越界的那几条命令",
+      hint: "过滤掉常规命令，看剩下的",
+      output: `    203 git push --force origin HEAD
+    118 gh pr create --fill
+     47 ssh-keygen -t ed25519 -f ~/.ssh/deploy_key -N ''
+     31 cat ~/.ssh/config
+     22 echo "Host github-svc-*" >> ~/.ssh/config
+     14 git config --global user.email "agent@example.com"
+      9 curl -X POST https://hooks.internal/deploy ...`,
+    },
+    {
+      cmd: "cat gate.ts",
+      goal: "看清权限门为什么没生效",
+      hint: "读一遍拦截逻辑，注意它在什么条件下才会拦",
+      output: `import { isToolCallEventType } from "@earendil-works/pi-coding-agent"
+
+export default function (pi) {
+  pi.on("tool_call", async (event, ctx) => {
+    if (!isToolCallEventType("bash", event)) return
+    const cmd = event.input.command
+
+    // 危险命令要人确认
+    if (/rm -rf|drop table|--force/.test(cmd)) {
+      if (!ctx.hasUI) return            // ← 无 UI 时直接 return，等于放行
+      const ok = await ctx.ui.confirm("危险命令", cmd)
+      if (!ok) return { block: true, reason: "denied" }
+    }
+  })
+}`,
+    },
+    {
+      cmd: `jq -r 'select(.type=="turn.start") | .turn' audit.jsonl | tail -1`,
+      goal: "确认轮次上限有没有设",
+      hint: "看最后一轮的编号",
+      output: `2094
+
+（跑了 2094 轮。启动命令里没有任何轮次或预算限制）`,
+    },
+  ]}
+/>
+
+## 逐道防线复查
+
+### 防线一：工具集白名单 —— 没有设
+
+启动命令是 `pi -p --approve "..."`，工具集是默认的全套
+（`read` / `bash` / `edit` / `write`）。任务本身只需要改 YAML 和提 PR，
+`bash` 的全部能力是白给的。
+
+**该怎么做**:`--tools read,edit,write,bash` 已经是最低要求，
+更好的是把 git 操作包成受限工具，压根不给通用 `bash`。
+
+### 防线二：轮次与预算上限 —— 没有设
+
+2094 轮，六个小时，没有任何东西让它停。`-p` 模式跑到 cron 的下一个周期才结束。
+
+**该怎么做**:轮次上限、token 上限、墙钟上限、**外加无进展检测**。
+从账单曲线看，21 点之后成本还在涨但产出为零 ——
+一个「连续 20 轮没有成功的写操作就停」的检测，能把 312 美元变成 20 美元。
+
+### 防线三：权限门 —— 逻辑写反了
+
+```ts
+if (!ctx.hasUI) return            // 无 UI 时直接 return = 放行
+```
+
+这一行是整个事故的核心。作者的本意大概是「没界面就没法问」，
+但 `return` 在这里等于**允许执行**。正确写法:
+
+```ts
+if (!ctx.hasUI) {
+  return { block: true, reason: `无人值守模式拒绝执行危险命令：${cmd}。请改用安全的替代方案。` }
+}
+```
+
+而且匹配规则本身也太窄:`--force` 拦住了 `git push --force`，
+但 `ssh-keygen`、`>> ~/.ssh/config`、`curl -X POST` 这些**根本不在规则里**。
+
+**该怎么做**:白名单式分级（认不出来的按高危处理），而不是黑名单式匹配。
+
+### 防线四：隔离 —— 完全没有
+
+pi 直接跑在 bastion 上，宿主的 `~/.ssh`、`~/.secrets`、全局 git 配置都在手边。
+`defaultProjectTrust: "always"` 还让它无条件加载任何项目里的本地扩展和提示词 ——
+这等于把「三个仓库里的 `.pi/` 目录」也变成了可执行输入。
+
+**该怎么做**:容器里跑，只挂需要的仓库目录，凭据用短期 token，
+`defaultProjectTrust` 至少设成 `"never"`。
+
+## 为什么四道会同时失效
+
+不是巧合。它们有共同的成因:
+
+> **这个任务是从「我在旁边看着跑一次」直接搬到「无人值守跑一夜」的。**
+
+交互模式下这四道防线都不重要 —— 人就是防线。一旦人退场，
+每一道都要从「提示」变成「强制」，而没有人做这次转换。
+
+<Callout type="warn" title="从交互到无人值守，是一次完整的重新设计">
+不是加个 --approve 那么简单。要重新回答四个问题：
+它需要哪些工具？什么时候必须停？拿不到人的确认时默认怎么办？它能碰到什么？
+</Callout>
+
+## 加固清单
+
+```bash
+# 1. 工具集收窄
+pi -p --tools read,edit,write \
+  # 2. 硬上限（由外层脚本或扩展实现）
+  #    max_turns=60  max_usd=10  max_wall=30m  无进展 20 轮即停
+  # 3. 权限门：无 UI 时默认拒绝 + 白名单分级
+  # 4. 容器里跑，只挂 ~/work/repos，短期 token
+  "..."
+```
+
+```json
+// settings.json
+{ "defaultProjectTrust": "never" }
+```
+
+再加一条**事后**的:审计日志要能按「写操作」筛出来，并且每条都带回滚提示。
+这次能还原过程，靠的就是那份 `audit.jsonl`。
+
+<Quiz
+  id="runaway-root"
+  question="这次事故里，哪一处是「单点修复收益最大」的？"
+  options={[
+    {
+      text: '把 gate.ts 里 `if (!ctx.hasUI) return` 改成默认拒绝',
+      correct: true,
+      feedback: '对。这一行直接导致所有危险命令在无人值守下畅通无阻 —— 一行改动挡住 ssh-keygen、force push、curl 全部越界。',
+    },
+    {
+      text: '换更强的模型，让它别乱试',
+      feedback: '模型不是根因。防线缺失才是 —— 更强的模型也会有判断失误的时候。',
+    },
+    {
+      text: '把 defaultProjectTrust 改成 never',
+      feedback: '该改，但它只挡住「项目本地资源被加载」这一条路径，挡不住越界命令。',
+    },
+    {
+      text: '把提示词写得更详细，明确禁止改 ~/.ssh',
+      feedback: '提示词是软约束。这次它已经把 ssh 配置改了 22 次，说明软约束不管用。',
+    },
+  ]}
+  explain="安全默认值只有一个：拿不到确认时拒绝。这一条比其余所有加固加起来都重要。"
+/>
+
+## 这一节的结论
+
+1. 「问不了就放行」是事故的共同起点 —— 无 UI 时必须默认拒绝。
+2. 黑名单匹配永远漏，用白名单分级 + 未知按高危。
+3. 无人值守必须有四类上限，外加无进展检测。
+4. 交互 → 无人值守是一次重新设计，不是加个参数。
+5. 事后能不能还原，取决于事前有没有审计 —— 写操作要带回滚提示。

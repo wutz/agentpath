@@ -1,0 +1,191 @@
+Pi 不内置权限弹窗。文档说得很明白:它「不包含内置沙箱」，
+project trust「不是沙箱，也不限制模型能让工具做什么」。
+
+这不是偷懒。理由是:一个进程内的半沙箱**很容易被误认为安全边界**，
+而它底下仍然靠着宿主的 shell、文件系统、包管理器和凭据。
+真正的隔离必须来自操作系统或虚拟化（那是下一阶段的内容）。
+
+所以这一节做的是另一件事:在**你自己定义的危险边界**上建一道门。
+
+## 先定义什么叫危险
+
+别一上手就写正则拦 `rm`。先按后果分类:
+
+| 档 | 判据 | 例子 | 策略 |
+| --- | --- | --- | --- |
+| 安全 | 无副作用、可重复 | `read` `grep` `ls` `git status` | 放行 |
+| 局部可逆 | 只动工作目录，且有版本控制 | `edit` `write` `git commit` | 放行，事后可 diff |
+| 不可逆 | 删数据、改历史 | `rm -rf` `git push --force` `DROP TABLE` | 拦，必须确认 |
+| 对外可见 | 别人会看到 | `git push` `curl -X POST` 外部 API、发消息 | 拦，必须确认 |
+| 越界 | 碰工作目录以外 | 写 `~/.ssh`、`/etc`、别的仓库 | 拦，默认拒绝 |
+
+最后两档是重点。「删了本地一个文件」通常能救回来，「往生产发了个请求」救不回来。
+
+## 落点只有一个：tool_call
+
+要拦就拦在「已决定执行、尚未执行」这个唯一时点。Pi 的 `tool_call` 事件是阻塞的:
+
+```ts
+import { isToolCallEventType } from "@earendil-works/pi-coding-agent"
+
+export default function (pi: ExtensionAPI) {
+  pi.on("tool_call", async (event, ctx) => {
+    if (!isToolCallEventType("bash", event)) return
+
+    const risk = classify(event.input.command)
+    if (risk === "safe") return
+
+    // 没有界面（print / 无人值守）时不能弹框 —— 默认拒绝，别默认放行
+    if (!ctx.hasUI) {
+      return { block: true, reason: `无人值守模式拒绝执行 ${risk} 级命令：${event.input.command}` }
+    }
+
+    const ok = await ctx.ui.confirm(
+      `确认执行？（${risk}）`,
+      event.input.command,
+    )
+    if (!ok) {
+      return { block: true, reason: "用户拒绝了这条命令。换个方式，或者说明为什么必须这么做。" }
+    }
+  })
+}
+```
+
+三个关键决定藏在这段代码里:
+
+1. **`ctx.hasUI` 为假时默认拒绝。** 无人值守场景下没法问人，
+   而「问不了就放行」是所有事故的共同起点。
+2. **`reason` 是写给模型的。** 说清「被拒了 + 可以怎么办」，
+   否则它会原地重试同一条命令。
+3. **`terminate: true` 要慎用。** 它会在这一批工具结束后停下整轮 ——
+   适合「这次任务方向不对」，不适合「这条不行换一条」。
+
+## 路径保护
+
+路径判断比命令判断更值得做，因为它的判据清晰:**在工作目录内 or 不在**。
+
+```ts
+import { resolve, relative, isAbsolute } from "node:path"
+
+function outsideWorkspace(target: string, cwd: string) {
+  const abs = resolve(cwd, target)
+  const rel = relative(cwd, abs)
+  return rel.startsWith("..") || isAbsolute(rel)
+}
+```
+
+要拦的路径清单（官方 protected-paths 示例的思路）:
+
+```ts
+const NEVER_WRITE = [
+  /(^|\/)\.git\/(config|hooks)\//,   // 改 hooks 等于任意代码执行
+  /(^|\/)\.ssh\//,
+  /(^|\/)\.aws\//, /(^|\/)\.kube\//,
+  /(^|\/)\.env(\.|$)/,               // 凭据
+  /^\/etc\//, /^\/usr\//,
+  /(^|\/)node_modules\//,            // 改了也会被覆盖，纯浪费
+]
+```
+
+<Callout type="trap" title="路径匹配的四个坑">
+`../` 穿越、符号链接（`resolve` 之后再 `realpath`）、大小写不敏感的文件系统
+（macOS 上 `.SSH` 也能命中真实目录）、还有 shell 展开（`~`、`$HOME`、glob）——
+拿字符串匹配 `bash` 命令里的路径，永远漏得比拦得多。
+</Callout>
+
+上面那句提醒很重要:**命令行审查天生是不完备的**。
+
+```bash
+rm -rf /important                  # 拦得住
+r''m -rf /important                # 引号拼接
+eval "$(echo cm0gLXJm | base64 -d)" # 编码
+python -c "import shutil; shutil.rmtree('/important')"  # 换语言
+git config core.pager 'rm -rf /'   # 改配置后由别的命令触发
+```
+
+不是说别做 —— 拦下 90% 的**误操作**已经很有价值。但要清楚它防的是「模型判断失误」，
+不是「有人主动绕过」。后者只能靠隔离。
+
+## 参数改写：比拦截更温和的一手
+
+`event.input` 是可变的，改了就是真的改了执行参数。这给了第三条路 ——
+不拦，而是**改成安全的版本**:
+
+```ts
+pi.on("tool_call", async (event) => {
+  if (!isToolCallEventType("bash", event)) return
+
+  // 强制 dry-run
+  if (/^kubectl\s+delete/.test(event.input.command)
+      && !event.input.command.includes("--dry-run")) {
+    event.input.command += " --dry-run=client"
+  }
+
+  // 给所有命令加超时，避免挂死
+  if (!event.input.command.startsWith("timeout ")) {
+    event.input.command = `timeout 300 ${event.input.command}`
+  }
+})
+```
+
+<Callout type="warn" title="改写之后不会再做 schema 校验">
+文档明确说明:mutation 会到达真实执行、后续 handler 看到改过的值、
+**之后不再重新校验**。所以改写代码本身就是安全边界的一部分，写错了没人兜。
+</Callout>
+
+## 确认疲劳：门太多等于没有门
+
+一个每三步就弹框的 agent，用户三分钟后就会开始无脑点「允许」。降低频率的四招:
+
+1. **只拦最后两档**（不可逆 / 对外可见），前面全放行。
+2. **同类记住选择**:这次批准了 `git push origin feature/*`，本会话内同模式不再问。
+3. **批量确认**:一次列出接下来要跑的 5 条命令，一起批。
+4. **给「阅读模式」开关**:`--no-approve` 之类，明确进入只读，就完全不用问。
+
+## 无人值守的四道防线
+
+弹框在无人值守时没有意义。这时候靠的是四层叠加，缺一层就有事故:
+
+| 防线 | 挡什么 |
+| --- | --- |
+| 白名单工具集（`--tools read,grep,find,ls`） | 从根上没有写入能力 |
+| 预算与轮次上限 | 烧钱、死循环 |
+| 路径 / 命令拦截，无 UI 时默认拒绝 | 误判造成的破坏 |
+| 容器 / micro-VM 隔离 | 上面三层全失效时的兜底 |
+
+L4 的「失控的 agent」那节会让你逐条复查这四道防线为什么会同时失效。
+
+<Quiz
+  id="gate-defaults"
+  question="你的权限门在 print 模式（无人值守）下拿不到 UI。这时最合理的默认行为是？"
+  options={[
+    {
+      text: '放行 —— 否则自动化流程会被卡住',
+      feedback: '「问不了就放行」是几乎所有 agent 事故的共同起点。',
+    },
+    {
+      text: '拒绝，并在 reason 里说清是无人值守模式拒绝的，让模型换安全的做法',
+      correct: true,
+      feedback: '对。安全默认值应该是拒绝；要放行就得是显式配置过的白名单。',
+    },
+    {
+      text: '写进日志然后放行，事后人工审计',
+      feedback: '不可逆操作的事后审计等于事后通报。',
+    },
+    {
+      text: '把命令挂起，等下次有人进交互模式时再问',
+      feedback: '状态难维护，而且自动化任务早就结束了。',
+    },
+  ]}
+  explain="无人值守场景要靠「预先配置的白名单 + 隔离」，不是靠临时判断。"
+/>
+
+## 交作业
+
+给 L1 写的 mini-agent 加一道门:
+
+1. `bash` 工具执行前分类，不可逆/对外可见的两档要确认。
+2. `write_file` 只允许写工作目录内，路径先 `resolve` 再 `realpath`。
+3. 无交互环境下一律拒绝，并把拒绝原因回灌给模型。
+4. 试着绕过你自己的门（引号、编码、换语言），把绕过成功的样本记下来 ——
+   这份清单就是你需要沙箱的理由。

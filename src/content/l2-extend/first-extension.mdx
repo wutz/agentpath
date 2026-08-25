@@ -1,0 +1,210 @@
+这一节从一个真实需求出发:团队的服务清单在一个内部 HTTP 接口里，
+每次排查都要人去查一遍「这个服务的 owner 是谁、部署在哪个集群」。
+把它做成 agent 手里的工具。
+
+顺带把命令、快捷键、事件注入四件事都过一遍。
+
+## 骨架
+
+```bash
+mkdir -p ~/.pi/agent/extensions/svc-lookup
+cd ~/.pi/agent/extensions/svc-lookup
+```
+
+单文件也行（`~/.pi/agent/extensions/svc-lookup.ts`），但目录形式方便以后拆模块、加依赖。
+
+```ts
+// ~/.pi/agent/extensions/svc-lookup/index.ts
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import { Type } from "typebox"
+
+export default function (pi: ExtensionAPI) {
+  // 注册从这里开始
+}
+```
+
+可用的 import 就这几样:`@earendil-works/pi-coding-agent`（类型与工具函数）、
+`typebox`（参数 schema）、`@earendil-works/pi-ai`（比如 `StringEnum`）、
+`@earendil-works/pi-tui`（渲染），加上 Node 内置模块和你自己装的依赖。
+
+## 第一步：注册工具
+
+```ts
+  pi.registerTool({
+    name: "svc_lookup",
+    label: "Service Lookup",
+    description:
+      "按服务名查内部服务台账，返回 owner、代码仓库、部署集群与命名空间。" +
+      "只支持精确服务名；不确定名字时先用模糊搜索参数 fuzzy=true 拿候选列表。",
+    promptGuidelines: [
+      "Use svc_lookup before asking the user who owns a service.",
+      "Use svc_lookup with fuzzy=true when the exact service name is unknown.",
+    ],
+    parameters: Type.Object({
+      name: Type.String({ description: "服务名，例如 order-api" }),
+      fuzzy: Type.Optional(Type.Boolean({ description: "模糊搜索，返回候选列表" })),
+    }),
+
+    async execute(_toolCallId, params, signal) {
+      const url = new URL("https://svc.internal/api/lookup")
+      url.searchParams.set("name", params.name)
+      if (params.fuzzy) url.searchParams.set("fuzzy", "1")
+
+      // signal 一定要传下去，否则 Escape 停不掉这个请求
+      const res = await fetch(url, { signal })
+
+      if (res.status === 404) {
+        return {
+          content: [{
+            type: "text",
+            text: `找不到服务 ${params.name}。台账里没有这个精确名字，` +
+                  `可以带 fuzzy=true 重试拿候选列表。`,
+          }],
+          isError: true,
+        }
+      }
+      if (!res.ok) {
+        return {
+          content: [{ type: "text", text: `台账接口返回 ${res.status}，稍后重试或人工确认。` }],
+          isError: true,
+        }
+      }
+
+      const data = await res.json()
+      // content 给模型：只留决策需要的字段
+      // details 给界面：完整原始数据，不占上下文
+      return {
+        content: [{ type: "text", text: format(data) }],
+        details: { raw: data },
+      }
+    },
+  })
+```
+
+三个细节值得停一下:
+
+1. **`signal` 传给了 `fetch`** —— 漏了它，Escape 之后请求还在跑。
+2. **错误返回写成了三段式**，并且明确给出「下一步能试什么」。
+3. **`content` 精简、`details` 放全量** —— 富信息不该挤模型的窗口。
+
+<Callout type="tip" title="description 里写清「不支持什么」">
+「只支持精确服务名」这半句，能省掉三四轮试错。模型不怕限制，怕的是不知道限制。
+</Callout>
+
+## 第二步：命令与快捷键
+
+工具是给模型用的，命令是给人用的。同一份逻辑两个入口:
+
+```ts
+  pi.registerCommand("svc", {
+    description: "查服务台账（不消耗模型调用）",
+    handler: async (args, ctx) => {
+      if (!args.trim()) return ctx.ui.notify("用法：/svc <服务名>", "warn")
+      const info = await lookup(args.trim())
+      ctx.ui.notify(info ? format(info) : `找不到 ${args}`, info ? "info" : "warn")
+    },
+    getArgumentCompletions: (prefix) =>
+      CACHED_NAMES.filter((n) => n.startsWith(prefix)).map((n) => ({ value: n, label: n })),
+  })
+
+  pi.registerShortcut("ctrl+shift+s", {
+    description: "查当前目录对应的服务",
+    handler: async (ctx) => {
+      const guess = ctx.cwd.split("/").pop()!
+      ctx.ui.setStatus("svc", `查询 ${guess}...`)
+      const info = await lookup(guess)
+      ctx.ui.setStatus("svc", info ? `${guess} → ${info.owner}` : "")
+    },
+  })
+```
+
+人查一次不需要花模型的钱，这是命令存在的意义。
+
+## 第三步：事件注入动态上下文
+
+每轮开始前，把「当前仓库对应哪个服务」这条事实塞进去，省得模型每次都去查:
+
+```ts
+  pi.on("before_agent_start", async (_event, ctx) => {
+    const info = await lookupCached(ctx.cwd)
+    if (!info) return
+    return {
+      message: `[环境] 当前目录对应服务 ${info.name}，owner ${info.owner}，` +
+               `部署在 ${info.cluster}/${info.namespace}。`,
+    }
+  })
+```
+
+<Callout type="warn" title="注入进消息，别注入进系统提示">
+放消息里，缓存前缀不动;写进系统提示，每轮变一次就等于缓存全废（L0 算过这笔账）。
+另外记得缓存查询结果 —— 每轮一个 HTTP 请求会把延迟顶上去。
+</Callout>
+
+## 第四步：把状态挂在会话上
+
+如果你的扩展有状态（比如「本次会话里已经查过哪些服务」），不能只放内存里 ——
+用户 fork 到另一条分支后，内存状态就和会话分叉了。Pi 给的做法是从会话重建:
+
+```ts
+  let queried: string[] = []
+
+  pi.on("session_start", async (_event, ctx) => {
+    queried = []
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type === "message" && entry.message.role === "toolResult"
+          && entry.message.toolName === "svc_lookup") {
+        const raw = (entry.message as any).details?.raw
+        if (raw?.name) queried.push(raw.name)
+      }
+    }
+  })
+```
+
+规律是:**状态写进工具结果的 `details`，启动时从当前分支重算**。
+
+## 调试
+
+```bash
+pi -e ~/.pi/agent/extensions/svc-lookup   # 临时加载，快速试
+/reload                                    # 改完热重载（放在发现目录里才行）
+pi --mode json -p "order-api 的 owner 是谁"  # 看事件流：工具有没有被调、返回了什么
+```
+
+三个高频问题:
+
+| 现象 | 原因 |
+| --- | --- |
+| 模型压根不调这个工具 | description 没说清「什么时候用」;或 promptGuidelines 写了「this tool」 |
+| 调了但参数总是错 | schema 的字段 description 缺失，或没有用枚举约束取值 |
+| Escape 之后请求还在跑 | `signal` 没往下传 |
+
+<Quiz
+  id="first-extension-checks"
+  question="你的自定义工具写完了，模型偶尔会调它、但经常宁愿去问用户。最可能的原因是？"
+  options={[
+    {
+      text: '模型能力不够，换更强的模型',
+      feedback: '先别怪模型。工具「什么时候该用」这件事，是你在 description 里告诉它的。',
+    },
+    {
+      text: 'description / promptGuidelines 没有明确说「遇到 X 情况就用这个工具」',
+      correct: true,
+      feedback: '对。声明里缺少触发条件，模型只能靠猜；写清场景后调用率会明显变化。',
+    },
+    {
+      text: '工具注册得太晚了',
+      feedback: 'Pi 允许运行中注册且立刻可用，时机不是问题。',
+    },
+    {
+      text: 'parameters 用了 typebox 而不是 JSON Schema',
+      feedback: 'typebox 就是官方推荐的写法。',
+    },
+  ]}
+  explain="工具声明是提示词的一部分 —— 调用率低，先改文字，别先换模型。"
+/>
+
+## 交作业
+
+1. 把这个扩展改造成查你自己团队真实用得上的东西（工单、告警、值班表都行）。
+2. 加一条只读的 `list` 动作，并给它加分页参数与「还有 N 条」提示。
+3. 用 `--mode json` 确认:一次典型问答里，这个工具被调了几次、每次返回多少 token。

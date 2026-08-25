@@ -1,0 +1,186 @@
+Pi 的能力边界几乎完全由扩展决定 —— sub-agent、plan mode、权限门、路径保护、
+SSH 执行、沙箱、自定义压缩，官方全都是**示例扩展**而不是内置功能。
+所以「扩展能碰到什么」这个问题，等价于「你能把它改成什么」。
+
+## 一个扩展就是一个默认导出的函数
+
+```ts
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+
+export default function (pi: ExtensionAPI) {
+  pi.on("session_start", async (event, ctx) => {
+    ctx.ui.notify(`会话开始，原因：${event.reason}`)
+  })
+}
+```
+
+就这样。工厂函数可以是 async（会在启动流程里被等待），加载走 jiti，
+所以 **TypeScript 不需要编译**。
+
+放哪就能被发现:
+
+| 位置 | 作用范围 |
+| --- | --- |
+| `~/.pi/agent/extensions/*.ts` | 全局，所有项目 |
+| `~/.pi/agent/extensions/*/index.ts` | 全局，目录形式 |
+| `.pi/extensions/*.ts` | 项目本地（需要项目已 trusted） |
+| `.pi/extensions/*/index.ts` | 项目本地，目录形式 |
+
+`pi -e ./x.ts` 适合临时试;放到上面这些位置的好处是**支持 `/reload` 热重载**。
+
+<Callout type="warn" title="工厂函数里不要起后台资源">
+文档明确要求:不要在工厂里起进程、socket、文件监听、定时器。
+放到 `session_start` 或触发它的命令/工具里，并在 `session_shutdown` 里做**幂等**清理。
+理由很实际 —— `/reload` 会走一遍 shutdown + start，工厂里起的东西会泄漏。
+</Callout>
+
+## 五类扩展点
+
+### 1. 工具
+
+```ts
+pi.registerTool({ name, label, description, promptSnippet, promptGuidelines,
+                  parameters, execute, renderCall, renderResult })
+```
+
+可以在加载时注册，也可以**运行中**注册（在 `session_start`、命令、其它 handler 里）——
+新工具立刻出现在 `pi.getAllTools()` 里并可被调用，不需要 `/reload`。
+配合 `pi.setActiveTools(names)` 就能做「按任务阶段换一套工具」。
+
+### 2. 命令
+
+```ts
+pi.registerCommand("stats", {
+  description: "显示会话统计",
+  handler: async (args, ctx) => {
+    ctx.ui.notify(`${ctx.sessionManager.getEntries().length} 条 entry`, "info")
+  },
+})
+```
+
+可以给参数补全（`getArgumentCompletions`）。多个扩展注册同名命令不会互相覆盖 ——
+按加载顺序加数字后缀（`/review:1`、`/review:2`）。
+
+### 3. 快捷键与命令行开关
+
+```ts
+pi.registerShortcut("ctrl+shift+p", { description: "切换 plan mode", handler: async (ctx) => {} })
+pi.registerFlag("plan", { description: "以 plan mode 启动", type: "boolean", default: false })
+```
+
+### 4. 事件
+
+这是最有力的一类。挑几组关键的:
+
+| 组 | 事件 | 能干什么 |
+| --- | --- | --- |
+| 启动 | `project_trust`、`resources_discover` | 自己决定信任、注入 skill/prompt/theme 路径 |
+| 会话 | `session_start` / `_shutdown`、`session_before_switch` / `_fork` / `_compact` / `_tree` | 建/清资源、拦截切换、接管压缩 |
+| 一轮 | `before_agent_start`、`turn_start` / `turn_end`、`context` | 注入消息、改系统提示、**改发给模型的 messages** |
+| 工具 | `tool_call`（阻塞）、`tool_result`（可改）、`tool_execution_*` | 权限门、参数改写、结果加工 |
+| 提供方 | `before_provider_headers` / `_request`、`after_provider_response` | 加头、改载荷、观测响应 |
+| 其它 | `user_bash`、`input`、`model_select` | 接管 `!` 命令、改写输入、跟随模型切换 |
+
+`tool_call` 是权限门的落点 —— 它是**阻塞**的，可以返回 `{ block: true, reason }`：
+
+```ts
+import { isToolCallEventType } from "@earendil-works/pi-coding-agent"
+
+pi.on("tool_call", async (event, ctx) => {
+  if (isToolCallEventType("bash", event)) {
+    if (event.input.command.includes("rm -rf")) {
+      return { block: true, reason: "Dangerous command", terminate: true }
+    }
+  }
+})
+```
+
+注意 `event.input` 是**可变的**:改了就是真的改了执行参数，后面的 handler 看到的是
+改过的值，而且**不会再做 schema 校验**。威力大，脚也容易开枪。
+
+`input` 事件的处理顺序值得记住:**扩展命令先匹配（直接跳过 input）→ `input` 事件
+→ skill 展开 → 提示词模板 → 交给 agent**。返回 `{ action: "continue" | "transform" | "handled" }`，
+transform 会链式叠加，第一个 `handled` 获胜。
+
+### 5. 界面
+
+`ctx.ui` 的对话框与状态栏（上一节讲过），加上三种渲染注册:
+
+```ts
+pi.registerMessageRenderer(type, renderer)    // 自定义消息（进上下文）
+pi.registerEntryRenderer(type, renderer)      // 自定义 entry（不进上下文）
+pi.registerMarkdownTransformer(transformer)   // 只改显示，不改内容
+```
+
+## 上下文对象:你能读到什么
+
+```ts
+ctx.ui  ctx.mode  ctx.hasUI  ctx.cwd  ctx.signal
+ctx.sessionManager    // getEntries / getBranch / buildContextEntries / getLeafId
+ctx.model  ctx.modelRegistry  ctx.thinkingLevel  ctx.scopedModels
+ctx.getContextUsage()  ctx.compact()  ctx.getSystemPrompt()
+ctx.isIdle()  ctx.abort()  ctx.shutdown()
+```
+
+命令的上下文（`ExtensionCommandContext`）多一批会话操作:`newSession`、`fork`、
+`navigateTree`、`switchSession`、`waitForIdle`、`reload`。
+
+<Callout type="trap" title="这批方法只能在命令里调">
+文档写得很直接:在事件 handler 里调用它们**会死锁**。
+需要从工具里触发的话，官方给的模式是「命令做入口 + 工具把命令排队」：
+`pi.sendUserMessage("/reload-runtime", { deliverAs: "followUp" })`。
+</Callout>
+
+## 加载顺序、隔离与安全
+
+- 多个扩展的 `tool_result` 处理**链式叠加**（按加载顺序），每个都能看到上一个的修改。
+- `pi.events` 是跨扩展共享的事件总线，扩展之间靠它通信。
+- 扩展**以你的完整系统权限运行、可以执行任意代码**。
+  只装可信来源 —— 这句是文档原文的意思，不是我加的免责声明。
+- 用 `CONFIG_DIR_NAME` 而不是硬写 `.pi`（重新品牌化的构建里目录名可能不同）。
+
+## `/reload` 的语义
+
+`/reload`（或 `ctx.reload()`）会:发 `session_shutdown` → 重新加载资源 →
+发 `session_start`（reason `"reload"`）和 `resources_discover`（同 reason）。
+
+坑在于:**当前正在执行的 handler 还跑在旧代码帧里**。await 之后的代码不能相信旧的内存状态。
+文档给的建议是把它当终结操作:
+
+```ts
+await ctx.reload()
+return
+```
+
+<Quiz
+  id="extension-points"
+  question="你要实现「危险的 bash 命令执行前弹确认框」。应该挂在哪个扩展点上？"
+  options={[
+    {
+      text: 'tool_call 事件 —— 它是阻塞的，可以 block，也能读到 event.input.command',
+      correct: true,
+      feedback: '对。这是官方 permission-gate 示例的做法：阻塞、可拦、能改参数。',
+    },
+    {
+      text: 'tool_result 事件里判断，发现危险就把结果改掉',
+      feedback: '太晚了 —— 命令已经执行完，结果改了也无法挽回。',
+    },
+    {
+      text: 'input 事件里检查用户输入有没有危险意图',
+      feedback: '拦的是人说的话，不是模型要执行的命令。模型可以从无害的请求推出危险的命令。',
+    },
+    {
+      text: '在 AGENTS.md 里写「执行危险命令前先问我」',
+      feedback: '软约束，不是拦截。提示词挡不住一次误判。',
+    },
+  ]}
+  explain="要拦就拦在「已决定执行、尚未执行」这个唯一的时点上 —— 那就是 tool_call。"
+/>
+
+## 这一节的结论
+
+1. 扩展 = 一个默认导出的函数 + 一批注册调用 + 一批事件订阅，TypeScript 免编译。
+2. 五类扩展点:工具、命令、快捷键/开关、事件、界面。事件是最有力的一类。
+3. `tool_call` 阻塞可拦、`event.input` 可改且不再校验 —— 权限门就落在这里。
+4. 工厂里不起后台资源;命令专属的方法别在事件 handler 里调（会死锁）。
+5. 扩展有你的全部权限，只装可信来源。

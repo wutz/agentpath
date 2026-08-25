@@ -1,0 +1,146 @@
+同样的模型、同样的答案，等三十秒黑屏和边跑边出字，用起来是两个东西。
+这一节讲事件模型 —— 它既是界面的地基，也是排障、计费、评测的共同入口。
+
+## 事件流是唯一的对外接口
+
+Pi 的内核不知道界面长什么样。它只往外发事件，谁想显示谁自己订阅。
+SDK 里就是一行:
+
+```ts
+session.subscribe((event) => {
+  if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+    process.stdout.write(event.assistantMessageEvent.delta)
+  }
+})
+```
+
+这条流的事件类型（TUI、RPC、JSON 模式共用同一套）:
+
+| 类别 | 事件 |
+| --- | --- |
+| 一轮 | `turn_start` / `turn_end`、`agent_start` / `agent_end` / `agent_settled` |
+| 消息 | `message_start` / `message_update` / `message_end` |
+| 工具 | `tool_execution_start` / `_update` / `_end` |
+| 队列 | `queue_update` |
+| 压缩 | `compaction_start` / `_end` |
+| 重试 | `auto_retry_start` / `_end`、`summarization_retry_*` |
+
+`message_update` 里套着一层增量事件:`text_start` / `text_delta` / `text_end`、
+`thinking_*`、`toolcall_start` / `toolcall_delta` / `toolcall_end`。
+
+<Callout type="note" title="agent_end 与 agent_settled 不是一回事">
+`agent_end` 是「一次底层运行结束了」;`agent_settled` 是「没有自动重试、
+没有压缩重试、没有排队消息了，真的停了」。要判断「任务完成」请用后者 ——
+用错会在重试中间误报完成。
+</Callout>
+
+## 三个必踩的坑
+
+### 1. 增量不是快照
+
+Pi 的 RPC 文档写得很明确:没有累积快照，客户端要自己按 `contentIndex`
+从 `message_start` 开始拼，并且**把 `message_end.message` 当权威**。
+
+意思是:你边拼边显示，但最后一定要用 `message_end` 覆盖一次。
+中间丢了一个 delta（网络抖动、客户端卡顿）而你不做这一步，界面上就永远缺一段。
+
+### 2. 工具的 partialResult 是累积的
+
+反过来，`tool_execution_update.partialResult` 给的是**累积输出**，不是增量 ——
+所以显示时直接整体替换，别追加，否则内容会翻倍。用 `toolCallId` 关联到对应的调用。
+
+这两个方向相反的约定是最容易写错的地方，写客户端时贴在显示器上:
+
+```
+message_update  → 增量，要拼
+tool_*_update   → 累积，直接换
+```
+
+### 3. usage 可能是零
+
+顶层 `usage` 是提供方给的最新累计值。有些提供方流式中间不给用量 ——
+这时它就一直是 0，直到最后。别在流中间拿它算钱或画进度。
+
+## 长工具的进度与可中断
+
+模型输出有 delta 可以流式，但工具执行往往是「跑四分钟测试」这种黑箱。
+体感全靠两件事:
+
+**进度上报** —— Pi 的工具 `execute` 签名里带 `onUpdate`:
+
+```ts
+async execute(toolCallId, params, signal, onUpdate, ctx) {
+  onUpdate?.({ content: [{ type: "text", text: "正在跑第 3 / 12 个测试文件..." }] })
+  // ...
+}
+```
+
+**可中断** —— 同一个签名里的 `signal` 是 AbortSignal。任何阻塞 I/O 都要把它传下去，
+否则 Escape 按了也停不下来。这条在扩展文档里被反复强调，因为漏传是常态。
+
+<Callout type="warn" title="漏传 signal 的表现">
+用户按 Escape，界面回到输入状态，但后台那个 `curl` 还在跑、那个测试还在烧 CPU。
+更糟的是它跑完之后还想往一个已经结束的会话里写结果。传 signal，
+并且在扩展的 `session_shutdown` 里做**幂等**清理。
+</Callout>
+
+## 终端 UI 的三个老问题
+
+如果你要做 TUI（Pi 用的是自家的 `@earendil-works/pi-tui`，差分渲染）:
+
+- **重绘** —— 每帧全量重画会闪、会拖慢滚动。差分渲染只重画变了的行。
+- **宽字符** —— 中文、emoji 占两列。按字符数算宽度的代码在中文界面上一定错位。
+- **滚动与截断** —— 输出比屏幕高时，是滚动、折叠、还是只显示尾部？
+  Pi 的做法是工具结果默认折叠、可展开。
+
+非终端宿主（Web、桌面、Slack）复用同一条事件流就行 —— 这也是把渲染彻底赶出内核的回报:
+Pi 的 TUI、RPC 客户端、`--mode json` 三个消费者，用的是同一套事件。
+
+## 扩展能往界面上加什么
+
+Pi 的 `ctx.ui` 给了两类能力:
+
+```ts
+await ctx.ui.confirm("标题", "确定吗？")      // 阻塞对话框：select / confirm / input / editor
+ctx.ui.notify("完成了", "info")               // 发完就走
+ctx.ui.setStatus("my-ext", "处理中...")       // 底栏状态
+ctx.ui.setWidget("my-ext", ["第一行", "第二行"]) // 编辑器上方的挂件
+```
+
+注意用 `ctx.hasUI` 和 `ctx.mode`（`"tui" | "rpc" | "json" | "print"`）做守卫 ——
+RPC 模式下对话框走一个专门的子协议（`extension_ui_request` / `extension_ui_response`），
+而 `custom()` 这类直接渲染只在 `tui` 下有意义。print 模式压根没有界面。
+
+<Quiz
+  id="stream-assembly"
+  question="你在写一个 Web 前端消费 Pi 的事件流。下面哪些处理是对的？"
+  options={[
+    {
+      text: '把 message_update 的 text_delta 按 contentIndex 拼接显示，收到 message_end 后用它的完整消息覆盖一次',
+      correct: true,
+      feedback: '对。增量要拼，最终以 message_end 为权威 —— 这样丢包也能自愈。',
+    },
+    {
+      text: '把 tool_execution_update 的 partialResult 追加到已显示的内容后面',
+      feedback: '它是累积值，追加会导致内容成倍重复。应该整体替换。',
+    },
+    {
+      text: '用流中间的 usage 实时显示本次花费',
+      feedback: '有提供方在流中间不给用量，会一直是 0。等最终值再算。',
+    },
+    {
+      text: '用 agent_settled 而不是 agent_end 判断「任务结束、可以收起进度条」',
+      correct: true,
+      feedback: '对。agent_end 之后可能还有自动重试或排队消息。',
+    },
+  ]}
+  explain="两个方向相反的约定 + 一个「什么叫真的结束」，是消费事件流最常出错的三处。"
+/>
+
+## 这一节的结论
+
+1. 事件流是内核唯一的对外接口，TUI / RPC / JSON / 你的前端都只是消费者。
+2. `message_update` 是增量要拼，`tool_*_update` 是累积直接换;`message_end` 权威。
+3. 「结束」用 `agent_settled` 判断。
+4. 长工具靠 `onUpdate` 报进度、靠 `signal` 可中断 —— signal 必须一路传下去。
+5. 中文界面记得按显示宽度算列，别按字符数。

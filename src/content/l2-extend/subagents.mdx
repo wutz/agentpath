@@ -1,0 +1,166 @@
+Pi 的「What we didn't build」里明确列着:不做 sub-agent。给的替代方案是
+「用 tmux 起多个 pi，或者自己造一个」。
+
+这不是能力缺失 —— 是把一个**默认不该开**的东西挪出了核心。这一节讲清它到底解决什么，
+以及为什么大多数人用错了。
+
+## sub-agent 真正解决的是上下文隔离
+
+最常见的误解:「拆成多个 agent 能并行，所以更快」。
+
+实际上并行的收益经常被吃掉:多个 agent 各自要把上下文重建一遍（重发系统提示、工具声明、
+任务背景），而且主 agent 要等最慢的那个。真正的收益在另一边:
+
+> 一个子任务需要读十个文件、跑三次 grep，才能得出一句结论。
+> 那十个文件的内容**不需要留在主上下文里**，主 agent 只要那句结论。
+
+这就是 sub-agent 的全部价值:**用一次额外的模型调用，换掉几万 token 的中间产物**。
+
+<Callout type="note" title="一个判断标准">
+问自己：这个子任务的中间过程，主 agent 后面还需要看吗？
+需要 → 别派出去，派出去等于把信息丢了。
+不需要 → 派出去，能省下大量窗口。
+</Callout>
+
+## 自己造一个
+
+sub-agent 本质就是一个工具，只不过它内部又跑了一个 agent。用 SDK 实现最直接:
+
+```ts
+import { createAgentSession, ModelRuntime, SessionManager }
+  from "@earendil-works/pi-coding-agent"
+import { Type } from "typebox"
+
+export default function (pi: ExtensionAPI) {
+  pi.registerTool({
+    name: "investigate",
+    label: "Sub-agent",
+    description:
+      "派一个独立的子 agent 去调查一件事，只返回结论。" +
+      "适合「需要翻很多文件才能得出一句判断」的任务，比如定位某个功能在哪实现、" +
+      "确认某个配置项的实际取值。不要用它做修改类任务。",
+    promptGuidelines: [
+      "Use investigate when answering a question would require reading many files whose contents are not needed afterwards.",
+    ],
+    parameters: Type.Object({
+      task: Type.String({ description: "给子 agent 的完整任务描述，它看不到当前对话" }),
+    }),
+
+    async execute(_id, params, signal) {
+      const modelRuntime = await ModelRuntime.create()
+      const { session } = await createAgentSession({
+        sessionManager: SessionManager.inMemory(),   // 不落盘
+        modelRuntime,
+        tools: ["read", "grep", "find", "ls"],       // 只读！
+      })
+
+      let text = ""
+      const off = session.subscribe((e) => {
+        if (e.type === "message_update"
+            && e.assistantMessageEvent.type === "text_delta") {
+          text += e.assistantMessageEvent.delta
+        }
+      })
+
+      signal?.addEventListener("abort", () => void session.abort())
+      await session.prompt(
+        `${params.task}\n\n只返回结论，附上关键文件与行号作为依据，不要复述过程。`,
+      )
+      off()
+      session.dispose()
+
+      return { content: [{ type: "text", text }], details: { task: params.task } }
+    },
+  })
+}
+```
+
+四个设计决定值得逐条说:
+
+1. **只给只读工具。** 子 agent 会修改文件的话，主 agent 就不知道世界变成什么样了 ——
+   状态分叉是多 agent 系统最难查的一类 bug。
+2. **`SessionManager.inMemory()`。** 子会话不该污染主会话的文件树。
+3. **要求「只返回结论 + 依据」。** 不加这句，它会把过程复述一遍，
+   省窗口的目的直接落空。
+4. **signal 传下去。** 主 agent 被 Escape 时子 agent 要跟着停。
+
+<Callout type="tip" title="别忘了报用量">
+Pi 的工具返回可以带 `usage` 字段，用来上报「嵌套的模型调用花了多少」，
+它会进入底栏、`/session` 和 RPC 的总计。子 agent 是烧钱大户，
+不报用量的话你的成本统计会凭空少一大块。
+</Callout>
+
+## 并发的账
+
+假设主任务需要调查 3 件独立的事，每件约 15 轮:
+
+| 方案 | 模型调用 | 主上下文增长 | 墙钟 |
+| --- | --- | --- | --- |
+| 主 agent 自己查 | ~45 轮，全部在主上下文 | +50k 以上，可能撞窗口 | 串行，最慢 |
+| 3 个子 agent 串行 | ~45 轮 + 3 次上下文重建 | +3 段结论，约 +2k | 差不多 |
+| 3 个子 agent 并行 | 同上 | 同上 | 约 1/3 |
+
+结论:**省上下文是稳定收益，省时间是附带收益**。而如果这三件事本来就只要各读一个文件，
+派出去纯亏 —— 三次上下文重建的成本远超省下的那点窗口。
+
+## 三种失败形态
+
+多 agent 系统的问题总是这三种之一:
+
+| 失败 | 表现 | 起因 |
+| --- | --- | --- |
+| **目标漂移** | 子 agent 交回来的东西答非所问 | 任务描述里省略了主上下文才有的前提 |
+| **信息损耗** | 主 agent 基于残缺结论做了错决定 | 只要结论不要依据，或结论里没有不确定性说明 |
+| **责任真空** | 谁都以为对方会做验证 | 没规定「验证是谁的活」 |
+
+对应的三条纪律:
+
+1. **任务描述必须自包含。** 子 agent 看不到你的对话。把背景、约束、
+   期望输出格式全写进去 —— 宁可长。
+2. **要求结构化返回**，并且允许它说「不确定」。
+   ```
+   结论：<一句话>
+   依据：<文件:行号，最多 5 条>
+   不确定的地方：<有就写，没有写「无」>
+   ```
+3. **验证留在主 agent。** 子 agent 给判断，动手和验证由主 agent 做。
+
+## 什么任务不该派出去
+
+- **需要全局上下文的** —— 「按我们刚才定的方案改」，子 agent 不知道方案是什么。
+- **需要人确认的** —— 确认应该发生在主流程，子 agent 里弹框逻辑难以收敛。
+- **修改类任务** —— 除非你能接受主 agent 对文件状态的认知过期。
+- **只要读一两个文件的** —— 直接读更省。
+
+<Quiz
+  id="when-subagent"
+  question="下面哪个任务最适合派给 sub-agent？"
+  options={[
+    {
+      text: '按刚才讨论定下的方案，把 3 个文件里的 API 调用都改掉',
+      feedback: '修改类 + 依赖对话上下文，两条都犯了。',
+    },
+    {
+      text: '在这个 20 万行的仓库里查清「用户登录失败重试」这个逻辑是在哪实现的',
+      correct: true,
+      feedback: '对。要翻大量文件，但主 agent 只需要「在 X 文件 Y 行」这个结论。',
+    },
+    {
+      text: '读一下 package.json 看用的是什么包管理器',
+      feedback: '一个文件就够，派出去的开销远大于收益。',
+    },
+    {
+      text: '决定这次重构该用策略模式还是组合',
+      feedback: '这是需要完整上下文的判断，而且该由人参与。',
+    },
+  ]}
+  explain="判据只有一条：中间过程主 agent 后面还需不需要看。不需要，才值得派出去。"
+/>
+
+## 这一节的结论
+
+1. sub-agent 的价值是上下文隔离，不是并行加速。
+2. 只给只读工具、内存会话、要求「结论 + 依据 + 不确定性」、传 signal、报 usage。
+3. 任务描述必须自包含 —— 子 agent 看不见你的对话。
+4. 验证的责任留在主 agent。
+5. 需要全局上下文、需要人确认、要改文件、或只读一两个文件的任务，都不该派。

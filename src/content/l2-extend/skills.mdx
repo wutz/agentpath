@@ -1,0 +1,181 @@
+上下文那一节算过一笔账:写进系统提示的东西每轮都在付钱。但总有一些内容 ——
+「生成月报的完整流程」「处理 PDF 的那套脚本」—— 又长又重要，只是十次任务里只用得上一次。
+
+skill 就是这个问题的答案:**索引常驻，正文按需**。
+
+## skill 是什么
+
+一个目录，里面一份 `SKILL.md`，加上它需要的脚本和参考文档:
+
+```
+my-skill/
+├── SKILL.md              # 必需：frontmatter + 指令
+├── scripts/
+│   └── process.sh
+├── references/
+│   └── api-reference.md  # 详细文档，用得上时才读
+└── assets/
+    └── template.json
+```
+
+`SKILL.md` 是唯一必需的文件，其余全部自由。
+
+````markdown
+---
+name: brave-search
+description: Web search and content extraction via Brave Search API. Use for searching documentation, facts, or any web content.
+---
+
+# Brave Search
+
+## Setup
+
+```bash
+cd /path/to/brave-search && npm install
+```
+
+## Search
+
+```bash
+./search.js "query"              # 基础搜索
+./search.js "query" --content    # 带正文
+```
+````
+
+frontmatter 只有两个必填字段:
+
+| 字段 | 必填 | 约束 |
+| --- | --- | --- |
+| `name` | 是 | ≤64 字符，小写字母/数字/连字符，首尾不能是连字符，不能有连续连字符 |
+| `description` | 是 | ≤1024 字符，写清**做什么 + 什么时候用** |
+| `license` | 否 | 许可名或指向文件 |
+| `compatibility` | 否 | ≤500 字符，环境要求 |
+| `metadata` | 否 | 自由键值 |
+| `allowed-tools` | 否 | 空格分隔的预批准工具（实验性） |
+| `disable-model-invocation` | 否 | `true` = 不进系统提示，只能 `/skill:name` 手动触发 |
+
+## 渐进披露到底怎么运作
+
+四步，值得记牢:
+
+1. 启动时 Pi 扫描 skill 目录，**只取出每个 skill 的 name 和 description**。
+2. 这些条目以 XML 形式进入系统提示 —— 这是常驻成本，每个 skill 大约几十 token。
+3. 遇到匹配的任务时，模型用 `read` 工具读完整的 `SKILL.md`。
+4. 按里面的指令执行，脚本和资源都用相对路径找。
+
+一句话:**只有描述常驻上下文，正文按需加载**。
+
+<Callout type="warn" title="第 3 步不保证发生">
+文档明确说了：「模型并不总是这么做」。描述写得含糊，它就想不起来读。
+真要确保触发，用 `/skill:name` 手动点它，或者在 AGENTS.md 里加一句提示。
+</Callout>
+
+## description 决定了这个 skill 存在不存在
+
+这是整节最重要的一句话:**描述决定了 skill 什么时候被加载**。写砸了等于没写。
+
+| 差 | 好 |
+| --- | --- |
+| `description: Helps with PDFs.` | `description: PDF 处理：提取文本与表格、填写表单、合并拆分。处理 .pdf 文件、需要读取 PDF 内容或生成 PDF 时使用。` |
+| `description: 部署相关` | `description: 把服务发布到预发/生产：走哪个流水线、需要哪些审批、回滚怎么做。用户说「发版」「上线」「回滚」时使用。` |
+
+写法上抄这个结构:**做什么 + 覆盖哪些场景 + 什么关键词/情形下触发**。
+
+## 放在哪
+
+| 位置 | 范围 |
+| --- | --- |
+| `~/.pi/agent/skills/` | 全局 |
+| `~/.agents/skills/` | 全局，跨 harness 共享的约定目录 |
+| `.pi/skills/` | 项目（需要 trusted） |
+| `.agents/skills/` | 项目，从 cwd 往上找到 git 根 |
+
+还能从包（`skills/` 目录或 `package.json` 的 `pi.skills`）、设置里的 `skills` 数组、
+命令行 `--skill <path>` 加载。
+
+跨 harness 复用是个实用技巧 —— 把别的 agent 的 skill 目录直接挂进来:
+
+```json
+{
+  "skills": ["~/.claude/skills", "~/.codex/skills"]
+}
+```
+
+Pi 在这里刻意偏离了 Agent Skills 标准的一条规则:**不强制 `name` 与目录名一致**，
+理由正是「共享 skill 目录会被多个 harness 用」。
+
+## 发现规则的两个坑
+
+- 在 `~/.pi/agent/skills/` 和 `.pi/skills/` 里，根目录下的**散装 `.md` 文件**
+  只要有合法 frontmatter 就算一个 skill。
+- 在 `~/.agents/skills/` 和项目 `.agents/skills/` 里，**根目录下的 `.md` 被跳过** ——
+  必须是含 `SKILL.md` 的目录（或分组子目录里的 `.md`）。
+
+同名 skill 出现在两处:Pi 会警告，保留**先遇到的那一个**。
+
+## skill 也是命令
+
+```
+/skill:brave-search           # 加载并执行
+/skill:pdf-tools extract      # 带参数（参数以 `User: <args>` 附到 skill 正文后）
+```
+
+可以在 `/settings` 或配置里关掉:
+
+```json
+{ "enableSkillCommands": true }
+```
+
+## skill / AGENTS.md / 工具，怎么分
+
+这三者最容易混。判断口诀:
+
+| 内容 | 该做成 | 理由 |
+| --- | --- | --- |
+| 「用 bun 不用 npm」 | AGENTS.md | 高频、一行、每个任务都相关 |
+| 「发版的完整流程 + 检查清单 + 回滚步骤」 | **skill** | 长、低频、有明确触发场景 |
+| 「查服务台账」 | 工具 | 需要执行代码、要拿结构化结果 |
+| 「不许 push 到 main」 | 工具层拦截 | 禁止性约束不能靠按需加载 |
+
+<Callout type="trap" title="别把禁止性规则写进 skill">
+skill 没被触发就等于不存在。安全约束、边界规则必须放在每轮都生效的地方
+（AGENTS.md）或者执行处（权限门）。
+</Callout>
+
+## 安全
+
+文档的提醒很直白:skill「可以指示模型做任何事，也可能包含模型会去执行的代码」。
+装别人的 skill 前先读一遍。项目 skill 还额外受 project trust 保护。
+
+<Quiz
+  id="skill-vs-agents-md"
+  question="团队有一份 3000 字的「线上故障处置手册」，包含分级标准、各类故障的处置步骤、升级路径。最该怎么放？"
+  options={[
+    {
+      text: '写进 AGENTS.md，保证 agent 每轮都记得',
+      feedback: '3000 字每轮重发。绝大多数任务和故障处置无关，这笔钱白花。',
+    },
+    {
+      text: '做成 skill，description 写清「处理线上告警/故障、需要判断故障等级或升级路径时使用」',
+      correct: true,
+      feedback: '对。长、低频、触发场景明确 —— 教科书式的 skill。',
+    },
+    {
+      text: '拆成 30 个工具，每类故障一个',
+      feedback: '30 个声明常驻上下文，而且这些内容是「指令」不是「可执行动作」。',
+    },
+    {
+      text: '放进 SYSTEM.md 替换默认系统提示',
+      feedback: '既每轮付费，又丢掉了默认提示词里的工具约定。两头亏。',
+    },
+  ]}
+  explain="长 + 低频 + 有明确触发词 = skill。短 + 高频 = AGENTS.md。要执行代码 = 工具。"
+/>
+
+## 这一节的结论
+
+1. skill = 一个目录 + `SKILL.md`;只有 name 和 description 常驻上下文。
+2. description 决定它会不会被加载 —— 写「做什么 + 场景 + 触发词」。
+3. 模型不保证主动读正文，必要时用 `/skill:name` 强制。
+4. 长而低频的走 skill，短而高频的走 AGENTS.md，要执行的做工具，禁止性的进工具层。
+5. 可以直接挂载其它 harness 的 skill 目录复用。
